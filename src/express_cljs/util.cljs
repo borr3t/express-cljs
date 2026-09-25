@@ -188,6 +188,8 @@
 ;; silently ignores unknown option keys, so the wrapper whitelists them)
 ;; ---------------------------------------------------------------------------
 
+(declare argument-error)
+
 (defn strip-question-mark
   "`:case-sensitive?` -> :case-sensitive. Keywords keep their namespace;
    anything that is not a keyword is returned unchanged."
@@ -198,13 +200,15 @@
 
 (defn normalize-opts
   "Strips the `?` suffix from every top-level keyword key of `opts` and
-   drops nil-valued entries. nil -> {}."
+   drops nil-valued entries. nil -> {}; anything else that is not a map is
+   an argument-error."
   [opts]
+  (when-not (or (nil? opts) (map? opts))
+    (throw (argument-error (str "options must be a map, got " (pr-str opts))
+                           {:arg :opts :value opts})))
   (into {}
         (keep (fn [[k v]] (when (some? v) [(strip-question-mark k) v])))
         opts))
-
-(declare argument-error)
 
 (defn check-opts!
   "Throws an argument-error when `opts` (already normalised) is not a map or
@@ -348,3 +352,166 @@
   [e]
   (when (= :express-cljs/rpc-error (error-type e))
     (:code (error-data e))))
+
+;; ---------------------------------------------------------------------------
+;; Phase 2 additions: pure translation policy shared by core / route /
+;; middleware (inventory §5, §8.5, §10.6, §10.7). Still no interop: strings,
+;; keywords, maps.
+;; ---------------------------------------------------------------------------
+
+(defn trust-proxy-setting
+  "Translates the wrapper's `:trust-proxy` spellings (inventory 10.7) into
+   the value Express's 'trust proxy' setting accepts: booleans and integers
+   (hop count) pass through, a keyword names a proxy-addr subnet alias
+   (:loopback -> \"loopback\", also :linklocal, :uniquelocal), a string is
+   an IP / CIDR / CSV list passed verbatim, a vector of strings/keywords
+   becomes a comma-separated list, and a function of (ip index) passes
+   through. nil -> false. Anything else is an argument-error."
+  [v]
+  (cond
+    (nil? v) false
+    (boolean? v) v
+    (integer? v) v
+    (keyword? v) (name v)
+    (string? v) v
+    (sequential? v) (str/join ", " (map #(if (keyword? %) (name %) (str %)) v))
+    (fn? v) v
+    :else (throw (argument-error (str "trust-proxy: unsupported value " (pr-str v))
+                                 {:arg :trust-proxy :value v}))))
+
+(def app-option-keys
+  "Every option `core/app` accepts (kebab, `?` stripped). The first group
+   maps 1:1 onto Express settings (inventory 3.9); the second configures
+   the wrapper itself."
+  #{:env :trust-proxy :x-powered-by :case-sensitive-routing :strict-routing
+    :query-parser :etag :json-escape :json-replacer :json-spaces :subdomain-offset
+    :cookie-secret :expose-errors :error-handler :on-error
+    :json :urlencoded :text :raw :json-limit})
+
+(defn app-settings
+  "Pure translation of the Express-setting subset of `core/app` options
+   (already normalised) into {\"setting name\" value} pairs, ready for
+   `app.set`. Enum keywords are rendered (:weak -> \"weak\", :extended ->
+   \"extended\"), `:env` becomes a string, `:trust-proxy` goes through
+   trust-proxy-setting. Absent keys are absent (Express keeps its default),
+   except `:x-powered-by`, which defaults to false (pitfall 9.14)."
+  [opts]
+  (let [opts (normalize-opts opts)
+        pick (fn [m k f] (if (contains? opts k) (assoc m (kebab->setting k) (f (get opts k))) m))]
+    (-> {"x-powered-by" (boolean (get opts :x-powered-by false))}
+        (pick :env #(if (keyword? %) (name %) (str %)))
+        (pick :trust-proxy trust-proxy-setting)
+        (pick :case-sensitive-routing boolean)
+        (pick :strict-routing boolean)
+        (pick :query-parser #(cond (keyword? %) (name %) :else %))
+        (pick :etag #(cond (keyword? %) (name %) :else %))
+        (pick :json-escape boolean)
+        (pick :json-replacer identity)
+        (pick :json-spaces identity)
+        (pick :subdomain-offset identity))))
+
+(def body-parser-reasons
+  "body-parser `err.type` -> wrapper `:reason` keyword (inventory 4.1)."
+  {"encoding.unsupported" :encoding-unsupported
+   "entity.parse.failed" :parse-failed
+   "entity.verify.failed" :verify-failed
+   "request.aborted" :aborted
+   "entity.too.large" :too-large
+   "request.size.invalid" :size-invalid
+   "stream.encoding.set" :stream-encoding-set
+   "stream.not.readable" :not-readable
+   "parameters.too.many" :too-many-parameters
+   "charset.unsupported" :charset-unsupported})
+
+(defn upstream-reason
+  "The wrapper `:reason` for an upstream http-error `type` string: the 4.1
+   table entry when known, else the dotted type kebab-cased (\"foo.bar\" ->
+   :foo-bar); nil for a blank type."
+  [type-str]
+  (when (and (string? type-str) (not (str/blank? type-str)))
+    (or (get body-parser-reasons type-str)
+        (keyword (str/lower-case (str/replace type-str #"[._\s]+" "-"))))))
+
+(def response-body-keys
+  "Response map keys that decide *how* the response ends; at most one may be
+   present (inventory 11.4)."
+  #{:body :redirect :send-file :download :format :end})
+
+(def response-keys
+  "Every key a response map may carry (inventory 11.4)."
+  (into response-body-keys
+        #{:status :headers :type :json :cookies :clear-cookies :vary :links :attachment}))
+
+(defn check-response!
+  "Validates a handler's response map before the binding touches `res`:
+   must be a map, only response-keys, at most one of response-body-keys, a
+   valid :status when given, :cookies / :clear-cookies vectors of maps with
+   a :name. Throws a server-error {:code :invalid-response} (a malformed
+   response is a server bug, so it renders as 500, never as the 400 an
+   argument-error would give). Returns the map."
+  [r]
+  (letfn [(fail [msg data]
+            (throw (server-error "INVALID_RESPONSE" msg (merge {:response r} data))))]
+    (when-not (map? r) (fail (str "response must be a map, got " (pr-str r)) {}))
+    (let [unknown (remove response-keys (keys r))
+          bodies (filter #(contains? r %) response-body-keys)]
+      (when (seq unknown) (fail (str "unknown response key(s) " (pr-str (vec unknown))) {:unknown (set unknown)}))
+      (when (> (count bodies) 1) (fail (str "response has more than one body key " (pr-str (vec bodies))) {:keys (set bodies)}))
+      (when (and (contains? r :status) (not (valid-status? (:status r))))
+        (fail (str "response :status must be an integer 100..599, got " (pr-str (:status r))) {:status (:status r)}))
+      (doseq [k [:cookies :clear-cookies]
+              :let [cs (get r k)]]
+        (when (some? cs)
+          (when-not (sequential? cs) (fail (str k " must be a vector of maps") {:key k}))
+          (doseq [c cs]
+            (when-not (and (map? c) (string? (:name c)))
+              (fail (str k " entries need a string :name, got " (pr-str c)) {:key k :entry c})))))
+      r)))
+
+(defn accepts-json?
+  "Content negotiation for the wrapper's own error bodies (inventory 8.5):
+   true when the request map's :accepts vector (pre-computed from the Accept
+   header, most preferred first) names JSON — or a wildcard — before any
+   text/html type, or when the request itself carried a JSON body. An
+   absent Accept header (Express reports [\"*/*\"]) counts as JSON."
+  [req]
+  (let [ct (str (:content-type req))
+        json-type? #(or (= % "*/*") (= % "application/*") (str/includes? % "json"))
+        text-type? #(or (= % "text/*") (str/starts-with? % "text/"))
+        first-relevant (some (fn [t] (cond (json-type? t) :json (text-type? t) :text :else nil))
+                             (:accepts req))]
+    (boolean (or (str/includes? ct "json")
+                 (= :json first-relevant)
+                 (and (nil? first-relevant) (empty? (:accepts req)))))))
+
+(defn error-response
+  "Renders any thrown value as a response map (inventory 8.5), without
+   touching `res`: an http-error keeps its :status, :headers and, when
+   :expose? is true, its :message and optional :body; every other error is
+   classified by error-status and shows its message only when
+   `:expose-errors?` is true (default: true unless :env is :production).
+   The body is {:error {:status .. :message .. :reason ..}} when the client
+   accepts JSON (accepts-json?), else the text \"<status> <message>\"."
+  [err req {:keys [env expose-errors?]}]
+  (let [d (or (ex-data err) {})
+        http? (= :express-cljs/http-error (error-type err))
+        status (error-status err)
+        expose-errors? (if (nil? expose-errors?) (not= :production env) expose-errors?)
+        message (cond
+                  http? (if (:expose? d) (:message d) (reason-phrase status))
+                  expose-errors? (or (some-> (:message d) str not-empty)
+                                     (some-> (ex-message err) not-empty)
+                                     (reason-phrase status))
+                  :else (reason-phrase status))
+        err-map (cond-> {:status status :message message}
+                  (and http? (:expose? d) (:reason d)) (assoc :reason (:reason d)))
+        json? (accepts-json? req)]
+    (cond-> {:status status
+             :headers (merge (when http? (:headers d))
+                             {:x-content-type-options "nosniff"})
+             :body (cond
+                     (and http? (:expose? d) (contains? d :body)) (:body d)
+                     json? {:error err-map}
+                     :else (str status " " message))}
+      (and json? (not (and http? (:expose? d) (contains? d :body)))) (assoc :json true)
+      (not json?) (assoc :type "text/plain"))))

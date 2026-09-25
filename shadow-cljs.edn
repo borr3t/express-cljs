@@ -3,8 +3,8 @@
 ;; promesa (pure ClojureScript, no npm package) is resolved from Clojars by the
 ;; standalone shadow-cljs CLI via the :dependencies key below; deps.edn mirrors
 ;; the same dependencies for consumers using :local/root / git deps.
-;; core.async ships with shadow-cljs itself (used by express-cljs.ws for the
-;; per-socket message channels, Phase 3).
+;; core.async ships with shadow-cljs itself (the core events channel today; the
+;; per-socket message channels of express-cljs.ws in the websocket phase).
 ;; The `express` / `ws` npm packages are required at runtime by the single binding
 ;; namespace (Phase 2); shadow's :node-* targets leave npm requires external.
 {:source-paths ["src" "test" "dev"]

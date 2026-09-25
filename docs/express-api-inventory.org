@@ -48,6 +48,8 @@ Every fact carries one or more evidence tags:
 - =[GH]= — GitHub repository metadata via the public API (2026-09-25): last commit,
   last push, open issue count, latest release.
 Anything not covered by these tags is in section 10 "Uncertain / needs verification".
+- =[IMPL]= — established while implementing Phase 2/3 (2026-09-25, this repo's test suite
+  against the same packages); section 13 lists every correction these made to the census.
 
 ** Reading conventions
 - Upstream names are given verbatim (camelCase JS options such as =maxPayload=,
@@ -76,7 +78,8 @@ Anything not covered by these tags is in section 10 "Uncertain / needs verificat
 | 10 | Uncertain / needs verification (numbered, with house positions)      | complete | 10      |
 | 11 | Implementation notes (translation, req/response map shapes, channels)| complete | 11      |
 | 12 | Phase 2/3/4 implementation outline (namespaces + public fns)         | complete | 12      |
-| 13 | Sources                                                              | complete | 13      |
+| 13 | Corrections log from the Phase 2/3 implementation                    | complete | 13      |
+| 14 | Sources                                                              | complete | 14      |
 
 * 1. Version decision: express 5.x vs 4.x
 ** 1.1 Registry facts [NPM]
@@ -267,6 +270,11 @@ three 4.x spellings above with a clearer message before upstream sees them.
   (router README: "the request will stall if this is not called"). The wrapper's adapter
   always ends the request: a response map → response; =nil= → =next()= (explicit
   fall-through, section 11.4); a rejection → =next(err)=.
+- *Implemented (Phase 3):* =next('route')= / =next('router')= are exposed as return-value
+  sentinels, not as a =next= argument: a handler returns =(route/next-route)= or
+  =(route/next-router)=; =(route/continue {:user u} {:x-request-id id})= is =next()= plus
+  keys merged into every later request map (the replacement for mutating =req=) plus
+  response headers set immediately. =route/control?= recognises the three.
 - Automatic behaviour without user routes: =HEAD= is served by the =GET= route (LIVE
   =HEAD /plain= → 200, headers of the GET, empty body); =OPTIONS= on a routed path answers
   =200= with =Allow: GET, HEAD= and the same text as body (LIVE); unknown path → 404
@@ -309,7 +317,7 @@ Express enables =allowPrototypes= (pitfall 9.7).
 | =express.static= miss with =fallthrough: true= (default) | =next()= → same 404 | dotfile denials (=403=) *also* fall through to this 404 (LIVE =dotfiles: 'deny'= → 404) |
 | =express.static= miss with =fallthrough: false= | =next(err)= | 404 with the =ENOENT= stack in development (LIVE) |
 | =route(path).all= | user | e.g. 405 (LIVE) |
-| wrapper (Phase 2) | =core/not-found= final middleware | JSON ={"error":{"status":404,"message":"Not Found"}}= or text by =Accept= (section 8.5) |
+| wrapper (Phase 2) | =core/not-found= final middleware | JSON ={"error":{"status":404,"message":"Not Found","reason":"not-found"}}= or text by =Accept= (section 8.5). *Implemented:* it calls =next()= for =OPTIONS= so the router's automatic =Allow= answer (3.3) still fires; an =OPTIONS= on an unknown path therefore ends in finalhandler's HTML 404 — the one path the wrapper does not render (documented edge) |
 
 ** 3.8 Methods and =QUERY= [LIVE http.METHODS][SRC express History.md unreleased]
 Node 22.23.2 exposes 35 methods including the new =QUERY=; Express derives its method
@@ -321,8 +329,8 @@ position: the wrapper's method keyword set is derived at runtime from the bindin
 ** 3.9 Application settings [DOC application][SRC express/lib/application.js defaultConfiguration, utils.js][LIVE app.settings]
 | Setting (upstream) | Type / values | Default (LIVE) | Wrapper key | Scope |
 |--------------------+---------------+----------------+-------------+-------|
-| ='case sensitive routing'= | boolean | undefined (false) | =:case-sensitive?= | core |
-| ='strict routing'= | boolean | undefined (false) | =:strict?= | core |
+| ='case sensitive routing'= | boolean | undefined (false) | =:case-sensitive-routing?= (app; the same flags are =:case-sensitive?= / =:strict?= on a nested router) — *corrected at implementation*: the app-option spelling mirrors the setting name so =util/kebab->setting= maps it 1:1 | core |
+| ='strict routing'= | boolean | undefined (false) | =:strict-routing?= (see above) | core |
 | ='env'= | string | =NODE_ENV= or ="development"= | =:env= | core (drives error rendering) |
 | ='etag'= | =true=/='weak'= (weak), ='strong'=, =false=, function | ="weak"= | =:etag= =:weak \vert :strong \vert false= | core |
 | ='json escape'= | boolean (escape =<>&= as unicode) | undefined | =:json-escape?= | core |
@@ -449,12 +457,12 @@ The rule "zero runtime npm deps beyond express + ws" is therefore kept: nothing 
 | =req.get(name)= / =req.header(name)= | case-insensitive lookup; =undefined= when absent | (use =:headers=) | =req.get('set-cookie')= returns an array |
 | =req.cookies= / =req.signedCookies= / =req.secret= | set by cookie-parser only | =:cookies= (wrapper-parsed map, 4.2), =:signed-cookies= (10.3) | LIVE: =undefined= without cookie-parser |
 | =req.ip= | string | =:ip= | via =proxy-addr= with the trust fn: LIVE =X-Forwarded-For: 10.0.0.9, 10.0.0.8= trusting loopback → =10.0.0.8= (nearest untrusted) |
-| =req.ips= | array | =:ips= | LIVE =["10.0.0.8"]= (the trusted chain stops at the first untrusted hop); =[]= when trust is off |
+| =req.ips= | array | =:ips= | LIVE =["10.0.0.8"]= (the trusted chain stops at the first untrusted hop); =[]= when trust is off. *Phase 2 test:* with =trust proxy 2= and =X-Forwarded-For: 10.0.0.9, 10.0.0.8= the vector is =["10.0.0.9" "10.0.0.8"]= — header order, client first (Express reverses proxy-addr's socket-first list) |
 | =req.protocol= / =req.secure= | ="http"=/="https"=, boolean | =:protocol= keyword, =:secure?= | =X-Forwarded-Proto= honoured only when trusted (LIVE =:https= / =true=) |
 | =req.host= / =req.hostname= | string | =:host= (with port), =:hostname= | =X-Forwarded-Host= when trusted (LIVE =api.example.com=); IPv6 literal aware |
 | =req.subdomains= | array | =:subdomains= | LIVE =["api"]= with offset 2 |
 | =req.xhr= | boolean | =:xhr?= | =X-Requested-With: XMLHttpRequest= |
-| =req.fresh= / =req.stale= | boolean | =:fresh?= / =:stale?= | conditional GET vs the *response* headers already set — meaningful only after =:etag=/=:last-modified= are set; the wrapper computes them lazily (10.6) |
+| =req.fresh= / =req.stale= | boolean | =core/fresh?= / =core/stale?= (helpers, not map keys) | conditional GET vs the *response* headers already set — *implemented* as =(core/fresh? req-map {:etag .. :last-modified ..})=, the =fresh= 2.0.0 algorithm over the intended response headers (10.6); it lives in =core= (not =util=) because HTTP-date parsing needs the platform =Date= |
 | =req.accepts(types)= / =acceptsEncodings= / =acceptsCharsets= / =acceptsLanguages= | negotiation (=accepts= package) | =:accepts= etc. as *pre-computed vectors* when called with no args (LIVE =["text/html","application/json"]=, =["gzip","br","identity"]=, =["en-GB","en"]=, =["*"]=), plus =core/accepts?= helpers taking the req map | q-values honoured (=application/json;q=0.9, text/html= → =html=) |
 | =req.is(type)= | string / =false= / *=null= when the request has no body* | =core/is?= | LIVE =req.is('json')= → =null= on a GET with =Content-Type= but no body |
 | =req.range(size, opts)= | =[{start,end}]= with =.type=, =-1= unsatisfiable, =-2= malformed | =core/range= → ={:type "bytes" :ranges [{:start 0 :end 99}]}= | LIVE |
@@ -482,7 +490,7 @@ The whole map is built *eagerly* except =:fresh?= / =:stale?= (need response hea
 | =res.redirect([status,] url)= | =:redirect "/plain"= or =:redirect {:url ".." :status 301}= | default 302; body negotiated (=Found. Redirecting to /plain= text/plain for a non-HTML client, =<p>…</p>= for HTML); =Vary: Accept= |
 | =res.location(url)= | =:headers {:location ..}= | |
 | =res.cookie(name, value, opts)= / =res.clearCookie(name, opts)= | =:cookies [{:name "a" :value "b" :http-only? true :same-site :lax :max-age 1000}]=, =:clear-cookies [{:name "gone"}]= | object values are serialised as =j:<json>=; =maxAge= ms → =Expires= + =Max-Age= seconds; =path= defaults =/=; =clearCookie= forces =Expires=Thu, 01 Jan 1970= and drops =maxAge=; =signed:true= throws without =req.secret= (LIVE) |
-| =res.vary(field)= | =:vary ["origin"]= or =:headers {:vary ..}= | duplicates ignored (LIVE one =Origin=) |
+| =res.vary(field)= | =:vary ["origin"]= or =:headers {:vary ..}= | duplicates ignored (LIVE one =Origin=); *implemented:* field names pass through as given (keywords by name), so =[:origin "Accept"]= is sent as =origin, Accept= |
 | =res.format({type fn ... default fn})= | =:format {:json (fn [req] ..) :text .. :default ..}= | 406 with =types= when nothing matches and no default; sets =Vary: Accept= (LIVE) |
 | =res.links({rel url})= | =:links {:next ".." :last ".."}= | =Link: <u>; rel="next", …= |
 | =res.locals= | — | not part of the map (11.4) |
@@ -846,6 +854,7 @@ Wrapper: =:express-cljs/ws-error {:code <kebab WS_ERR or :backpressure/:closed/:
 | body-parser / serve-static / =res.format= http-errors | =:express-cljs/http-error= with =:reason= from =err.type= (4.1) and =:cause= | as above (they are 4xx → exposed) |
 | no route | =core/not-found= | 404 ={:error {:status 404 :message "Not Found" :path ..}}= / text |
 | =argument-error= raised inside a handler | 400 | exposed message |
+| malformed response map (unknown key, two body keys, bad status) — =util/check-response!= | =:express-cljs/server-error {:code :invalid-response}= | 500 (*corrected from 11.4's "argument-error"*: a bad response map is a server bug, not a client error) |
 | listen / close failures | =:express-cljs/server-error {:code :eaddrinuse …}= | promise rejection (never a response) |
 | rpc | =:express-cljs/rpc-error= | JSON-RPC error object (7.4); on HTTP status 200 unless =:http-status-from-error?= |
 Every rendering path also emits ={:event :error …}= on the server's core.async
@@ -915,6 +924,20 @@ first. Falsy rejections become =:express-cljs/server-error {:code :rejected-fals
     not sub-apps, by default.
 26. *=npm audit= noise* comes from shadow-cljs, not express/ws; do not "fix" it with
     =--force= (that would jump to shadow-cljs 3.x).
+27. *Node =fetch= turns conditional requests into reloads.* Any =If-None-Match= /
+    =If-Modified-Since= header makes undici add =Cache-Control: no-cache= + =Pragma:
+    no-cache=, so =fresh()= says stale and no 304 is produced. Send an explicit
+    =Cache-Control= (e.g. =max-age=0=) from the client, or use =http.get= (Phase 2 finding).
+28. *=p/let= awaits every promise binding.* Binding an in-flight request or a
+    never-resolving deferred inside =p/let= blocks the whole form; bind such values with a
+    plain =let= (two Phase 2 test hangs came from this).
+29. *=mount-upstream!= appends after the routes.* Express runs layers in registration
+    order and =core/app= registers its plan eagerly, so middleware that must run first
+    (cors, helmet) goes in the route data as =(route/use (route/upstream f))=.
+30. *Table-form routes are sorted by specificity, ordered-form routes are not.* A map
+    has no source order; the table form sorts paths (literal < param < optional <
+    wildcard, per segment; a strict prefix first; RegExps last), the ordered form
+    (=route/routes=, vectors, tuples) is registered verbatim.
 
 * 10. Uncertain / needs verification (numbered; each with the recommended house position)
 1. *Header key casing policy.* HTTP names are case-insensitive; Node lower-cases input.
@@ -940,7 +963,12 @@ first. Falsy rejections become =:express-cljs/server-error {:code :rejected-fals
 6. *=:fresh?= / =:stale?= timing.* They depend on response headers; a lazily computed
    value inside the req map violates "plain map" purity. Position: expose
    =core/fresh?= taking the req map and the intended response headers instead of map
-   keys; the map carries the raw conditional headers only.
+   keys; the map carries the raw conditional headers only. *Implemented as positioned*
+   (=core/fresh?= / =core/stale?=, tested with a real 304 round-trip). Finding: Node's
+   =fetch= appends =Cache-Control: no-cache= (and =Pragma=) to any request that carries
+   a conditional header (Fetch spec cache-mode rule), which makes =fresh= — Express's and
+   ours — report *stale*; a client that wants a 304 from =fetch= must send its own
+   =Cache-Control= (pitfall 9.27).
 7. *Trust-proxy value spelling.* Express accepts booleans, numbers, CSV strings, arrays,
    functions. Position: =:trust-proxy= accepts =true=/=false=, integer, keyword names
    (=:loopback= → "loopback"), a vector of strings/keywords, or a fn of =(ip index)=.
@@ -1016,7 +1044,8 @@ metadata =^{:express-cljs/raw {:req req :res res}}= reachable only by =core= hel
 :attachment s :format {..} :end true}=; exactly one of =:body= / =:redirect= / =:send-file=
 / =:download= / =:format= / =:end=; =nil= from a handler means "not mine" (=next()=), a
 map without any body key means an empty response with =:status= (default 200; 204 when
-=:end=). A thrown =util/http-error= is the error path. Unknown keys → argument-error.
+=:end=). A thrown =util/http-error= is the error path. Unknown keys / two body keys / a
+bad status → =server-error {:code :invalid-response}= rendered as 500 (corrected, 8.5).
 ** 11.5 core.async design (Phase 3)
 - =ws/connections wss= → channel of ={:event :open :conn c}= / ={:event :close :conn c :code :reason}=
   (buffer 64, =put-or-cancel!= from the leveldb precedent; closing the channel
@@ -1033,21 +1062,46 @@ logger stays quiet); a final "process exits" assertion runs in the Phase 5 smoke
 the unit suite.
 
 * 12. Phase 2/3/4 implementation outline
-** 12.1 =express-cljs.core= (Phase 2, the only interop namespace)
-=app= (opts & routes/middleware) · =listen!= (app opts) → promise of server handle ·
-=close!= (server opts) · =address= · =listening?= · =connections!= · =events= (channel) ·
-=http-error= (re-export of util) · =not-found= · =error-response= · =mount-upstream!=
-(path, js middleware fn) · =with-raw= · =accepts?= / =is?= / =fresh?= / =range= (req helpers) ·
-=methods= (keyword set from Node) · =set-setting!= / =setting= · internal: =req->map=,
-=respond!=, =handler-adapter=, =error-adapter=, =cookie-sign= / =cookie-unsign=, =parse-cookies=.
-** 12.2 =express-cljs.route= (Phase 2, pure data → registration through core)
-=routes= · =get post put patch delete head options all query= (path [middleware] handler) ·
-=use= (path? middleware…) · =router= (path opts & routes) · =resource= (path {:get f :post f …} → 405 for the rest) ·
-=static= (path root opts) · =param= (name fn) · =check-path= · =compile= (routes → registration plan; testable without a server).
-** 12.3 =express-cljs.middleware= (Phase 2)
-=json urlencoded text raw= (option maps → upstream parsers via core) · =request-id= ·
-=timing= · =cors= (headers as data, preflight) · =basic-auth= · =bearer-auth= · =rate-limit=
-(in-memory token bucket, marker) · =compose= · =when= / =unless= (predicate wrappers).
+Phase numbering as executed: Phase 2 = =core= (this outline's 12.1), Phase 3 = =route= +
+=middleware= (12.2 / 12.3; delivered together with Phase 2, commit after 22991dd), the
+websocket layer (12.4) and the RPC layer (12.5) follow as the next two phases. The
+namespace seams they need are in place: =core/add-close-hook!= (ws clients close before
+=server.close=), the =:events= channel, =core/req->map= over any Express-prototyped
+request (the upgrade-request prototype trick of 10.9 is a one-liner inside =core= when
+the ws phase lands), and =util/rpc-error-codes=.
+** 12.1 =express-cljs.core= (Phase 2, the only interop namespace) — DONE
+=app= (opts & route sources) · =listen!= (app opts) → promise of server handle ·
+=close!= (server opts) · =finalize!= · =handler= · =address= · =listening?= ·
+=connections!= · =events= (channel) · =add-close-hook!= · =http-error= (re-export of util) ·
+=not-found= · =mount-upstream!= (app path? js middleware fn — appended after the routes,
+pitfall 9.29) · =with-raw= · =accepts?= / =is?= / =fresh?= / =stale?= / =range= (req helpers) ·
+=methods= (keyword set from Node) · =set-setting!= / =setting= · =req->map= · =respond!= ·
+=->error= · =readable-from= / =readable?= / =buffer?= · =parse-cookies= · =cookie-sign= /
+=cookie-unsign= · =cookies-and-signed= · =cookie-option-keys= · =listen-option-keys= /
+=close-option-keys=. Error rendering is =util/error-response= (pure) + =util/check-response!=
++ =util/accepts-json?=; app-option translation is =util/app-settings= +
+=util/trust-proxy-setting=; body-parser reasons =util/body-parser-reasons= /
+=util/upstream-reason=. Internal adapters: =handler-adapter= (arity 3), =error-adapter=
+(arity 4), =param-adapter= (arity 5), =final-error-handler=.
+** 12.2 =express-cljs.route= (Phase 3, pure data → registration through core) — DONE
+Two input forms (table map with specificity ordering; ordered =routes= / vectors /
+tuples) both compiled by =compile= into a plan of ops that =core/app= executes.
+=routes= · =route= · =get post put patch delete head options all query= (path & handlers,
+vectors = chains) · =use= (path? handlers…) · =router= (path opts? & sources) · =resource=
+(path {:get f :post f …} → 405 with =Allow= for the rest, =:all= overrides) · =static= (path
+root opts) · =param= (name fn) · =error= (path? fns…) · =error-handler= / =upstream=
+(descriptors) · =next-route= / =next-router= / =continue= / =control?= (flow control) ·
+=check-path= · =specificity= / =specificity-compare= · =compile= · =plan-paths= (introspection) ·
+=methods= (static 35-name set, asserted equal to =core/methods=) · =table-kinds= ·
+=descriptor?= / =handler?= / =op?=.
+** 12.3 =express-cljs.middleware= (Phase 3) — DONE (subset)
+Descriptors: =json urlencoded text raw= (option maps validated against 4.1, instantiated by
+core) · =static= (root opts). Express-layer helper: =request-id= (continue + header).
+Ring-style wrappers over =(fn [req] -> response | nil | promise)=: =wrap-json= ·
+=wrap-timing= · =wrap-logging= · =wrap-errors->http-error= · =wrap-require-header= ·
+=wrap-bearer-auth= · =wrap-cors= (headers as data, preflight 204) · =compose= · =wrap-when=.
+Wrappers report their own failures as rejected promises. Deferred (not needed yet):
+=basic-auth= (needs base64 — would live in core), =rate-limit=.
 ** 12.4 =express-cljs.ws= (Phase 3)
 =serve!= (server opts) · =connections= · =messages= · =send!= · =broadcast!= · =close!= (conn code reason) ·
 =terminate!= · =ctx= (conn) · =upgrade= (conn → upgrade map) · =join!= / =leave!= / =rooms= · =clients= ·
@@ -1061,7 +1115,33 @@ Case/setting/header translation, option normalisation and whitelists, reason phr
 =http-error= / =server-error= / =ws-error= / =rpc-error= / =argument-error=, =error-data=
 / =error-type= / =error-status= / =rpc-error-code=, =rpc-error-codes= table.
 
-* 13. Sources
+* 13. Corrections log (Phase 2/3 implementation, 2026-09-25)
+Claims in this document that implementation proved wrong or refined; each is also fixed in
+place above.
+| Section | Was | Now |
+|---------+-----+-----|
+| 3.3 | =next('route')= exposure undecided | return-value sentinels =route/next-route= / =next-router= / =continue= |
+| 3.7 | wrapper 404 renders everything | =OPTIONS= passes through so the automatic =Allow= works; unknown-path =OPTIONS= is finalhandler's HTML 404 |
+| 3.9 | app keys =:case-sensitive?= / =:strict?= | =:case-sensitive-routing?= / =:strict-routing?= (router opts keep the short spelling) |
+| 5.1 | =:fresh?= / =:stale?= "computed lazily" | helpers =core/fresh?= / =core/stale?= in =core= (Date parsing), not =util= |
+| 5.1 | =:ips= order unstated | header order, client first |
+| 5.2 | =:vary= values lower-cased by policy | passed through as given (the value is a field *list*, not a header name) |
+| 8.5 / 11.4 | malformed response map → argument-error (400) | =server-error {:code :invalid-response}= → 500 |
+| 11.2 | =util/jsget= "added to util as the one interop helper" | =jsget= is private to =core=; =util= stays interop-free |
+| 12.1 | =mount-upstream!= unspecified position | appends after the routes; =route/upstream= for before-routes middleware |
+| 12.3 | =timing= / =cors= / =basic-auth= / =rate-limit= as Express-layer helpers | Ring-style =wrap-*= over handlers; =basic-auth= / =rate-limit= deferred |
+| new | — | pitfalls 9.27 (fetch adds =Cache-Control: no-cache= to conditional requests), 9.28 (=p/let= awaits pending bindings), 9.29, 9.30 |
+Verified as inventoried: Express 5 async rejection forwarding (our adapter catches first),
+=getSetCookie= multiplicity (4 cookies read back), =cookie-signature= byte compatibility
+of the Node-crypto HMAC (sign and unsign both directions), traversal answers (=..%2f= → 404
+for static, =../= above =:root= → 403 for =sendFile=), 405 via =route().all=, automatic
+=HEAD= / =OPTIONS=, =mergeParams=, trust-proxy =loopback= / hop-count semantics,
+=server.close= reaping idle keep-alive connections on Node 22 (=close!= resolved in well
+under 1.5 s with a keep-alive client), =closeAllConnections= cutting an in-flight request
+after the deadline, and process liveness (with the test runner's =process.exit= neutralised
+the suite's process drained by itself in 1.5 s, leaving only the two stdio =PipeWrap=s).
+
+* 14. Sources
 ** npm registry (=npm view=, 2026-09-25)
 - express: =dist-tags {latest 5.2.1, latest-4 4.22.3}=; ws: 8.21.3; express-ws: 5.0.2 (=time.modified= 2022-06-17), peer =express ^4.0.0 || ^5.0.0-alpha.1=, dependency =ws ^7.4.6=.
 - =npm audit= (this repo, 2026-09-25): 6 low, all via shadow-cljs → node-libs-browser → crypto-browserify / elliptic.
