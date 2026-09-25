@@ -1,6 +1,7 @@
 (ns express-cljs.util-test
-  (:require [cljs.test :refer [deftest is testing]]
+  (:require [cljs.test :refer [deftest is testing async]]
             [clojure.string :as str]
+            [promesa.core :as p]
             [express-cljs.util :as util]
             [express-cljs.test-util :as tu]))
 
@@ -159,3 +160,21 @@
   (is (nil? (util/error-data (js/Error. "plain"))))
   (is (nil? (util/error-type nil)))
   (is (= 5 (count util/error-types))))
+
+(deftest promesa-drain-is-not-poisoned-by-a-throwing-body
+  ;; Pins the patched promesa/impl/promise.js (see shadow-cljs.edn): with
+  ;; upstream 12.0.1, `b` and `c` below never run and resolve with nil because
+  ;; `a` throws inside the same microtask drain of the shared null promise.
+  (async done
+    (let [ran (atom #{})
+          a (p/do (throw (ex-info "boom" {})))
+          b (p/do (swap! ran conj :b) :b)
+          c (p/let [_ nil] (swap! ran conj :c) :c)]
+      (-> (p/all [(p/catch a (fn [e] (ex-message e))) b c])
+          (p/then (fn [[ra rb rc]]
+                    (is (= "boom" ra))
+                    (is (= :b rb) "a sibling p/do body still runs after a throwing one")
+                    (is (= :c rc) "a p/let continuation on a nil binding too")
+                    (is (= #{:b :c} @ran))))
+          (p/catch (fn [e] (is false (str "unexpected rejection " (ex-message e)))))
+          (p/finally (fn [_ _] (done)))))))

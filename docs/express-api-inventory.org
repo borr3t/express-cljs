@@ -553,7 +553,7 @@ WebSocketServer createWebSocketStream extension subprotocol=; ready states =CONN
 | =noServer= | =false= | *always =true=*; exactly one of =port= / =server= / =noServer= must be given (else =TypeError=) |
 | =path= | =null= (accept all) | none: the wrapper routes in its own =upgrade= listener (=:path= string, set of strings, or predicate on the upgrade request map) |
 | =clientTracking= | =true= (creates =wss.clients= Set) | kept =true=; the wrapper also keeps its own registry (rooms, 6.10) |
-| =maxPayload= | =104857600= (100 MiB); 0 disables | =:max-payload= — wrapper default *1 MiB* (pitfall 9.10); over-limit → error =WS_ERR_UNSUPPORTED_MESSAGE_LENGTH=, connection closed (LIVE: server ='error'= then ='close'= 1006 on the server side; the source sends 1009 to the peer) |
+| =maxPayload= | =104857600= (100 MiB); 0 disables | =:max-payload= — wrapper default *1 MiB* (pitfall 9.10); over-limit → error =WS_ERR_UNSUPPORTED_MESSAGE_LENGTH=, connection closed (LIVE: server ='error'= then ='close'= 1006 on the server side; the source sends 1009 to the peer — *the client-side close event shows 1009 with an empty reason*, verified by =ws-test/max-payload-violation-client-sees-1009= and smoke check 34, uncertainty 10.2 settled) |
 | =perMessageDeflate= | =false= (server) | =:per-message-deflate= boolean or kebab option map (=serverNoContextTakeover=, =clientNoContextTakeover=, =serverMaxWindowBits=, =clientMaxWindowBits=, =zlibDeflateOptions=, =zlibInflateOptions=, =threshold= 1024, =concurrencyLimit= 10); README warns of zlib memory fragmentation |
 | =handleProtocols(protocolsSet, req) -> string \vert false= | =null= → first client-offered subprotocol is selected (LIVE =chat= from =chat,rpc=) | =:protocols= = vector of accepted names (wrapper picks the first client-offered one that is accepted) or a fn of =(offered-vector upgrade-map)= |
 | =verifyClient= | =null= | *none* (docs discourage; auth happens before =handleUpgrade=, 2.3) |
@@ -938,6 +938,23 @@ first. Falsy rejections become =:express-cljs/server-error {:code :rejected-fals
     has no source order; the table form sorts paths (literal < param < optional <
     wildcard, per segment; a strict prefix first; RegExps last), the ordered form
     (=route/routes=, vectors, tuples) is registered verbatim.
+31. *promesa 12.0.1 poisons a microtask drain after a synchronous throw.* Its
+    ClojureScript promise implementation (=promesa/impl/promise.js=, =processNextTick=)
+    keeps a mutable local =state= across the tasks of one drain; a throwing =p/do= /
+    =p/let= body (a =(throw (rpc-error ...))= in a method, an http-error in a handler)
+    flips it to REJECTED for every later task queued on the same promise — and every
+    =p/do= / =p/let= (and every =p/let= binding that evaluated to nil) queues on the
+    shared =NULL_PROMISE= singleton. Those bodies never run and resolve with =nil=
+    (a handler resolving nil is a silent =next()= → 404; an RPC notification is silently
+    dropped). Found by the ws RPC tests, reproduced with three lines of promesa.
+    House fix: =src/promesa/impl/promise.js= is a vendored copy re-reading the state per
+    task (the source path shadows the jar); pinned by
+    =util-test/promesa-drain-is-not-poisoned-by-a-throwing-body=. promesa 11.0.678 drains
+    correctly but four existing tests fail on its other semantics, so no downgrade.
+32. *A paused ws socket never emits ='close'=.* =ws.pause()= stops the receiver, and
+    ws only emits =close= once the receiver finished draining; =terminate()= on a paused
+    peer therefore resolves nothing on THAT side until it resumes. The wrapper's shutdown
+    only awaits the server side (fine); tests resume before awaiting a client close.
 
 * 10. Uncertain / needs verification (numbered; each with the recommended house position)
 1. *Header key casing policy.* HTTP names are case-insensitive; Node lower-cases input.
@@ -948,6 +965,9 @@ first. Falsy rejections become =:express-cljs/server-error {:code :rejected-fals
    showed 1006 (receiver error) and the source sends 1009 to the peer; the client-side
    code was not captured. Position: document "1009 expected, verify in the Phase 3
    tests" and make the wrapper's =ws-error= carry the =WS_ERR= code regardless.
+   *SETTLED (Phase 4 tests + smoke): the client sees =1009= with an empty reason; the
+   server-side close event stays =1006= and carries the ws-error
+   ={:code :unsupported-message-length :close-code 1009}= under =:error=.*
 3. *Signed cookies without cookie-parser.* =res.cookie(signed)= only needs =req.secret=;
    reading requires =cookie-signature.unsign= (HMAC-SHA256 base64, =s:= prefix) which is a
    transitive dependency we must not require. Position: Phase 2 implements sign/unsign
@@ -1003,6 +1023,9 @@ first. Falsy rejections become =:express-cljs/server-error {:code :rejected-fals
 17. *ws =closeTimeout= interaction with the wrapper deadline.* Two timers race
     (ws 30 s vs wrapper 2 s → =terminate()=). Position: the wrapper's =terminate()= wins;
     verify no double ='close'= event in Phase 3 tests (ws guards this in =close()=, SRC).
+    *VERIFIED (=ws-test/close-terminates-an-unresponsive-client-once=): a paused peer is
+    terminated at the wrapper's deadline (150 ms in the test), =stop!= reports
+    ={:closed 2 :terminated 1}=, exactly one close event per connection.*
 18. *Node =shouldUpgradeCallback= (22.21+).* Could replace the manual 404 for non-ws
     paths. Position: not used (portability to Node 18/20); the manual raw response stays.
 19. *Body-parser =verify= / =reviver= / =type= function options* need JS functions with
@@ -1023,6 +1046,10 @@ first. Falsy rejections become =:express-cljs/server-error {:code :rejected-fals
 | user JSON (bodies, RPC params/results, query keys, route param names) | never re-cased; keys keywordised *as spelled* | — | binding =->clj= with =:keywordize-keys= only |
 | enums | =:lax= → "lax", =:same-origin= → "sameOrigin", =:weak= → "weak" | =enum-value= |
 ** 11.2 Single binding namespace (=express-cljs.core=)
+*Corrected in Phase 4 (section 13): two binding namespaces — =core= for Express / Node
+(="express"=, ="http"=, ="crypto"=, ="stream"=) and =express-cljs.ws= for the ="ws"=
+package (plus the raw upgrade socket); =core= exposes the one Express seam the ws layer
+needs, =core/upgrade-request->map=.*
 The only file that =require=s ="express"=, ="ws"=, ="http"=, ="crypto"=, ="stream"=; house
 style =js-invoke= + =goog.object= (=util/jsget= pattern from viem-cljs, to be added to
 =util= in Phase 2 *as the one interop helper*), no =^js=, no dot-forms. It owns: app +
@@ -1063,12 +1090,13 @@ the unit suite.
 
 * 12. Phase 2/3/4 implementation outline
 Phase numbering as executed: Phase 2 = =core= (this outline's 12.1), Phase 3 = =route= +
-=middleware= (12.2 / 12.3; delivered together with Phase 2, commit after 22991dd), the
-websocket layer (12.4) and the RPC layer (12.5) follow as the next two phases. The
-namespace seams they need are in place: =core/add-close-hook!= (ws clients close before
-=server.close=), the =:events= channel, =core/req->map= over any Express-prototyped
-request (the upgrade-request prototype trick of 10.9 is a one-liner inside =core= when
-the ws phase lands), and =util/rpc-error-codes=.
+=middleware= (12.2 / 12.3; delivered together with Phase 2, commit after 22991dd), Phase 4
+= the websocket layer (12.4) and the RPC layer (12.5) together (127 tests / 1027
+assertions), Phase 5 = the localhost smoke (=dev/express_cljs/smoke.cljs=, 67 checks, the
+process exits by itself), Phase 6 = the manual (=docs/express-cljs.org=, API reference
+checked by =dev/api-index.sh=). The seams used: =core/add-close-hook!= (ws clients close
+before =server.close=), the =:events= channel, =core/upgrade-request->map= (the
+prototype trick of 10.9), and =util/rpc-error-codes=.
 ** 12.1 =express-cljs.core= (Phase 2, the only interop namespace) — DONE
 =app= (opts & route sources) · =listen!= (app opts) → promise of server handle ·
 =close!= (server opts) · =finalize!= · =handler= · =address= · =listening?= ·
@@ -1102,14 +1130,23 @@ Ring-style wrappers over =(fn [req] -> response | nil | promise)=: =wrap-json= �
 =wrap-bearer-auth= · =wrap-cors= (headers as data, preflight 204) · =compose= · =wrap-when=.
 Wrappers report their own failures as rejected promises. Deferred (not needed yet):
 =basic-auth= (needs base64 — would live in core), =rate-limit=.
-** 12.4 =express-cljs.ws= (Phase 3)
-=serve!= (server opts) · =connections= · =messages= · =send!= · =broadcast!= · =close!= (conn code reason) ·
-=terminate!= · =ctx= (conn) · =upgrade= (conn → upgrade map) · =join!= / =leave!= / =rooms= · =clients= ·
-=buffered-amount= · =json= (message → parsed) · =ping!= · =stop!= (wss).
-** 12.5 =express-cljs.rpc= (Phase 4)
-=registry= · =error= (= util/rpc-error) · =call!= (registry frame ctx) · =http-routes= (registry opts) ·
-=serve-ws!= (wss registry opts) · =notify!= (conn method params) · =broadcast-notify!= ·
-=parse-frame= / =response-frame= / =error-frame= (pure) · =client= (ws client helper) · =methods= (introspection).
+** 12.4 =express-cljs.ws= (Phase 4) — DONE (second binding namespace)
+=serve!= (server opts) · =stop!= · =connections= (sliding channel) · =on-open!= / =on-close!= (lossless
+hooks) · =conns= / =conn-count= / =conn-by-id= · =messages= / =out= (per-connection channels) · =send!= /
+=send-json!= / =send-binary!= · =broadcast!= / =emit!= · =join!= / =leave!= / =topics= / =topic->conns= ·
+=close!= (conn code reason opts) · =terminate!= · =closed= · =ping!= · =ready-state= / =open?= /
+=buffered-amount= · =ctx= · =upgrade= · =parse-json= / =json= / =->json= · =valid-close-code?= ·
+=->ws-error= / =ws-error-close-codes= · =keepalive-stats= · =connect!= / =events= (client side) ·
+=serve-option-keys= / =connect-option-keys= / =ready-states=. Renamed from the plan: =rooms= → =topics=,
+=clients= → =conns=.
+** 12.5 =express-cljs.rpc= (Phase 4) — DONE (pure)
+=registry= / =registry?= / =methods= / =method= · =error= (= util/rpc-error) · =call!= (registry frame ctx opts) ·
+=http-routes= / =http-handler= / =error-status= · =serve-ws!= · =notify!= / =broadcast-notify!= · =client= ·
+frames: =request-frame= / =notification-frame= / =response-frame= / =error-frame= / =check-frame= /
+=frame-id= / =valid-id?= / =request?= / =notification?= / =response?= / =error-response?= /
+=error->frame= / =error-data= / =frame->error= · option sets =method-option-keys= /
+=registry-option-keys= / =call-option-keys= / =http-option-keys= / =ws-option-keys= /
+=client-option-keys= · =version=. =parse-frame= from the plan became =ws/parse-json= + =check-frame=.
 ** 12.6 =express-cljs.util= — Phase 0 (done)
 Case/setting/header translation, option normalisation and whitelists, reason phrases,
 =http-error= / =server-error= / =ws-error= / =rpc-error= / =argument-error=, =error-data=
@@ -1131,6 +1168,19 @@ place above.
 | 12.1 | =mount-upstream!= unspecified position | appends after the routes; =route/upstream= for before-routes middleware |
 | 12.3 | =timing= / =cors= / =basic-auth= / =rate-limit= as Express-layer helpers | Ring-style =wrap-*= over handlers; =basic-auth= / =rate-limit= deferred |
 | new | — | pitfalls 9.27 (fetch adds =Cache-Control: no-cache= to conditional requests), 9.28 (=p/let= awaits pending bindings), 9.29, 9.30 |
+| 11.2 (Phase 4) | one binding namespace | two: =core= (Express / Node) and =ws= (the =ws= package + raw upgrade socket); =core/upgrade-request->map= is the seam (prototype trick of 10.9, implemented) |
+| 6.5 / 11.5 (Phase 4) | message maps ={:type :data}= + lazy =ws/json= | as planned; =:decode :json= adds =:json= / =:json-error=; the OUT channel (=ws/out=) sends anything put on it |
+| 11.5 (Phase 4) | connections channel with a fixed buffer / put-or-cancel | sliding buffer of 256 (events optional, like =core/events=) plus lossless =ws/on-open!= / =on-close!= callbacks (the RPC layer uses them) |
+| 6.10 (Phase 4) | =rooms= / =clients= | =topics= (=join!= / =leave!= / =topics= / =topic->conns= / =emit!=) and =conns= / =conn-count= / =conn-by-id= |
+| 6.4 (Phase 4) | connection =:protocol= unspecified | =:protocol= is =:ws= / =:wss= (from =:secure?=), =:subprotocol= the negotiated name |
+| 7.2 (Phase 4) | option =:http-status-from-error?= | =:status-map?= (boolean, or a ={code-keyword status}= map overriding the 7.4 table); parse errors answer 400 with a -32700 body (the 2011 HTTP-transport draft's 500 not followed: a client fault), 413 / 415 carry -32600 frames, notifications 204, non-POST 405 via =route/resource= |
+| 7.3 (Phase 4) | =:expose-errors? true= shows internal messages | as planned, plus: an argument-error thrown by a method is -32602, an http-error 401 / 403 is -32001 / -32002, other http-errors -32000 with =data.status=; =rpc.ping= built in (=:ping? false= removes it), =rpc.methods= with =:introspection? true= |
+| 7.4 (Phase 4) | error =data= | =rpc/error-data=: the =:data= entry of the ex-data when present, else the remaining non-reserved entries (so =(error :invalid-params "x" {:missing [:a]})= carries ={:missing [:a]}=) |
+| 10.13 (Phase 4) | =:batch?= marker | the option exists in every dispatch option set and only accepts =false= (true is an argument-error); batches answer -32600 with =data.batch? true= |
+| 10.2 (Phase 4) | client-side code unverified | 1009, empty reason (tests + smoke) |
+| 10.17 (Phase 4) | double close event unverified | one close event per connection; wrapper deadline terminates (=stop!= counts =:terminated=) |
+| 6.12 (Phase 4) | every socket error gets a close code | only =WS_ERR_*= receiver errors carry =:close-code= (1009 / 1007 / else 1002); plain socket errors (=ECONNRESET=, =ECANCELED=) keep their kebab code without one |
+| new (Phase 4) | — | pitfalls 9.31 (promesa 12.0.1 drain poisoning — vendored one-line patch in =src/promesa/impl/promise.js=) and 9.32 (a paused ws socket never emits close) |
 Verified as inventoried: Express 5 async rejection forwarding (our adapter catches first),
 =getSetCookie= multiplicity (4 cookies read back), =cookie-signature= byte compatibility
 of the Node-crypto HMAC (sign and unsign both directions), traversal answers (=..%2f= → 404

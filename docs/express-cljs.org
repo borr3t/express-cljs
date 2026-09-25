@@ -1,0 +1,832 @@
+#+TITLE: express-cljs — user manual
+#+AUTHOR: express-cljs
+#+DATE: 2026-09-25
+#+OPTIONS: toc:3 num:t
+
+* Introduction
+express-cljs is a ClojureScript (Node.js) binding of [[https://expressjs.com][Express 5]] for HTTP
+APIs, of the [[https://github.com/websockets/ws][ws]] package for WebSockets on the same HTTP server, and of a
+JSON-RPC 2.0 layer that serves ONE method registry over both transports (a single
+=POST /rpc= endpoint and websocket text frames). Everything a caller touches is
+ClojureScript data: kebab-case option maps in, kebab-case request / response /
+connection / frame maps out, promesa promises for every asynchronous operation,
+core.async channels for websocket messages and lifecycle events.
+
+The architecture is self-contained and deliberately thin:
+
+- =express-cljs.core= — the Express / Node binding: application and =http.Server=
+  lifecycle, request → map and map → response translation, cookies (with Node-crypto
+  signing), body parsers, static files, the error chain and renderer, graceful
+  =close!=.
+- =express-cljs.ws= — the =ws= binding: one =upgrade= listener per server,
+  pre-handshake authentication, connection maps with IN / OUT channels, topics,
+  broadcast, keepalive, the shutdown choreography, and a client (=connect!=).
+- =express-cljs.route= — routing as data (pure).
+- =express-cljs.middleware= — body-parser / static descriptors and Ring-style
+  wrappers (pure).
+- =express-cljs.rpc= — JSON-RPC 2.0 frames, registry, dispatch, HTTP routes,
+  websocket serving, notifications, client (pure: JSON goes through =ws=).
+- =express-cljs.util= — case translation, header policy, option validation, the
+  error constructors and the RPC error table (pure).
+
+Only =core= and =ws= contain JavaScript interop (house style: =js-invoke= +
+=goog.object=, no =^js= hints, no dot-forms). Runtime npm dependencies: =express=
+and =ws=, nothing else. The research behind every decision, with evidence, is
+=docs/express-api-inventory.org= (section numbers quoted in docstrings and below
+point there).
+
+* Quick start
+#+begin_src clojure
+(require '[express-cljs.core :as core]
+         '[express-cljs.route :as route]
+         '[express-cljs.middleware :as mw]
+         '[express-cljs.ws :as ws]
+         '[express-cljs.rpc :as rpc]
+         '[promesa.core :as p]
+         '[cljs.core.async :as async :refer [<! go-loop]])
+
+;; HTTP: handlers are (fn [req-map] -> response-map | nil | promise)
+(def app
+  (core/app {:env :production :trust-proxy :loopback :cookie-secret "s3cret" :json true}
+    {:use  [(mw/request-id)]
+     :get  {"/health"     (fn [_] {:body {:ok true}})
+            "/users/:id"  (fn [{:keys [params]}]
+                            (p/let [u (find-user (:id params))]
+                              (if u {:body u} (throw (core/http-error 404 "no such user")))))}
+     :post {"/users"      (fn [{:keys [body]}] {:status 201 :body (create-user! body)})}}
+    ;; RPC over HTTP: POST /rpc
+    (rpc/http-routes methods {:context (fn [req] {:user (get-in req [:headers :x-user])})})))
+
+;; one registry for both transports
+(def methods
+  (rpc/registry {"math/add" (fn [{:keys [a b]} _ctx] (+ a b))
+                 "jobs/run" (fn [params {:keys [notify! id]}]
+                              (p/do (when notify! (notify! "jobs/progress" {:id id :pct 50}))
+                                    {:done true}))}))
+
+(p/let [server (core/listen! app {:port 8080 :host "127.0.0.1"})
+        ;; one websocket endpoint, authenticated before the handshake
+        wsv    (ws/serve! server {:path "/ws" :max-payload 1048576 :keepalive-ms 30000
+                                  :authenticate (fn [{:keys [headers]}]
+                                                  (when-let [tok (:x-auth headers)] {:user (verify tok)}))})]
+  ;; raw frames: one IN channel per connection
+  (ws/on-open! wsv (fn [conn]
+                     (go-loop []
+                       (when-let [m (<! (ws/messages conn))]
+                         (ws/send! conn (str "echo " (:data m)))
+                         (recur)))))
+  ;; ... or JSON-RPC on another endpoint
+  (rpc/serve-ws! (ws/serve! server {:path "/rpc-ws"}) methods)
+  ;; shutdown: ws 1001 to every client, server.close, deadlines
+  (js/process.on "SIGTERM" #(core/close! server {:timeout-ms 5000 :ws-close-timeout-ms 2000})))
+#+end_src
+
+Build with shadow-cljs (=:node-script= / =:node-library= targets); =express= and =ws=
+are required at runtime from =node_modules=. The dependency on promesa is pinned to
+12.0.1 with a vendored one-line patch (see [[*Design decisions][Design decisions]]).
+
+* Core: application, server, request map, response map
+** The app
+=(core/app opts & route-sources)= builds an Express 5 application. Route sources
+(tables, =route/routes= bundles, entries, vectors of those) are registered in
+argument order (chapter [[*Routing as data][Routing as data]]). Options (kebab, =?= suffix
+optional on booleans):
+
+| Option | Meaning |
+|--------+---------|
+| =:env= | =:production= / =:development= / =:test= (Express 'env'; =:test= silences the 5xx console log) |
+| =:trust-proxy= | =false= (default), =true=, hop count, =:loopback= / =:linklocal= / =:uniquelocal=, a CIDR string, a vector, or =(fn [ip i])= |
+| =:x-powered-by?= | default =false= (Express's default is =true=) |
+| =:case-sensitive-routing?= =:strict-routing?= | router flags |
+| =:query-parser= | =:simple= (default), =:extended=, =false= or a fn |
+| =:etag= | =:weak= (default), =:strong=, =false= |
+| =:json-escape?= =:json-replacer= =:json-spaces= =:subdomain-offset= | Express settings |
+| =:cookie-secret= | enables =:signed-cookies= on the request map and ={:signed? true}= cookies |
+| =:expose-errors?= | show messages of non-http errors (default: true unless =:env= is =:production=) |
+| =:on-error= | =(fn [err req-map])= called for every rendered error (replaces the console log) |
+| =:error-handler= | =(fn [err req-map] -> response | nil)=, an app-wide error handler run before the renderer |
+| =:json= =:urlencoded= =:text= =:raw= | =true= or an option map: mounts that body parser globally before the routes |
+| =:json-limit= | shorthand for ={:json {:limit ..}}= |
+
+Settings can be read and written later with =core/setting= / =core/set-setting!=.
+=core/mount-upstream!= appends a caller-supplied Express middleware function after
+the routes (before =listen!=); for middleware that must run first put
+=(route/use (route/upstream f))= in the route data (pitfall 9.29).
+
+** listen! and the server handle
+=(core/listen! app {:port 0 :host "127.0.0.1"})= creates the =http.Server= itself
+(so the wrapper owns the =upgrade= event and the timeouts) and resolves with a
+server handle once listening; it rejects with a server-error
+={:code :eaddrinuse | :eacces ..}= when the port cannot be bound. Options:
+=:port= (0 = ephemeral), =:host=, =:backlog=, =:request-timeout-ms= (Node default
+300000), =:keep-alive-timeout-ms= (5000), =:headers-timeout-ms= (60000).
+
+On the handle: =core/address= (={:address :family :port}=), =core/listening?=,
+=core/connections!= (promise of the open connection count), =core/events= (a
+sliding-buffer channel of ={:event :listening | :close | :error | :server-error}=
+maps), =core/add-close-hook!= (what =ws/serve!= uses).
+
+** close! — the shutdown choreography
+=(core/close! server {:timeout-ms 5000 :ws-close-timeout-ms 2000})= resolves
+={:closed true :forced? bool}= (inventory 5.3, verified live on Node 22):
+
+1. every close hook runs with ={:timeout-ms ws-close-timeout-ms}= — the websocket
+   layer sends =close(1001, "server shutdown")= to each connection, waits for its
+   =close= event up to that deadline, then =terminate()=s the rest (the wrapper's
+   deadline wins over ws's 30 s =closeTimeout=; ws guards against a second =close=
+   event — verified by the tests);
+2. =server.close()= stops accepting; Node ≥ 19 also reaps idle keep-alive
+   connections and =closeIdleConnections()= is called for older Nodes;
+3. after =:timeout-ms= (an unref'd timer) =closeAllConnections()= cuts stuck
+   requests and =:forced?= becomes true;
+4. the promise resolves when Node's close callback fired. Closing a server that is
+   not listening rejects with ={:code :err-server-not-running}=.
+
+Afterwards the process holds no handle from this server: the smoke build exits by
+itself with =process.getActiveResourcesInfo()= empty.
+
+** The request map
+Every handler receives one map (inventory 11.3):
+
+={:method :url :original-url :base-url :path :params :query :body :headers
+:cookies :signed-cookies :ip :ips :protocol :secure? :host :hostname :subdomains
+:xhr? :http-version :remote-address :remote-port :accepts :accepts-encodings
+:accepts-charsets :accepts-languages :content-type :content-length :route :app-env
+:transport}= plus whatever earlier handlers merged with =route/continue=.
+
+- Header names are lower-case kebab keywords in both directions (=:content-type=);
+  values are untouched (=set-cookie= is a vector).
+- User JSON (=:body=, =:query=, route params) is keywordised as spelled, never
+  re-cased (=maxAge= stays =:maxAge=).
+- =:cookies= is parsed from the =Cookie= header without cookie-parser; with an app
+  =:cookie-secret=, =s:=-prefixed values move to =:signed-cookies= (verified with
+  Node crypto, byte-compatible with =cookie-signature=; a tampered value is
+  =false=); =j:= JSON cookies are decoded.
+- Negotiation helpers take the map: =core/accepts?=, =core/is?=, =core/range=,
+  =core/fresh?= / =core/stale?= (evaluated against the response headers you intend
+  to send). =core/with-raw= reaches the Node objects for caller-mounted middleware.
+
+** The response map
+A handler returns =nil= (not mine → =next()=), a flow-control sentinel (chapter
+[[*Routing as data][Routing as data]]), a response map, or a promise of one of those. Response keys
+(inventory 11.4):
+
+| Key | Effect |
+|-----+--------|
+| =:status= | default 200 (204 for =:end=) |
+| =:headers= | kebab map; vectors are multi-valued headers |
+| =:body= | string → =send=; map / vector / set (or =:json true=) → JSON; Buffer → binary; Node Readable → piped (streaming); nil → empty |
+| =:type= | content type (=:json=, ="text/plain"=) |
+| =:cookies= / =:clear-cookies= | vectors of ={:name :value :max-age :http-only? :secure? :same-site :signed? ..}= |
+| =:vary= =:links= =:attachment= | =res.vary= / =res.links= / =res.attachment= |
+| =:redirect= | ="/x"= or ={:url :status}= (default 302) |
+| =:send-file= | ={:path :root ..}= (always pass =:root=; traversal answers 403) |
+| =:download= | ={:path :filename :root ..}= |
+| =:format= | ={:json (fn [req]) :html .. :default ..}= (=res.format=, 406 otherwise) |
+| =:end= | end without a body (204) |
+
+Exactly one of the body keys may be present; a malformed map (unknown key, two
+body keys, bad status) is a server bug and renders as 500
+(=:express-cljs/server-error {:code :invalid-response}=).
+
+Streaming: =(core/readable-from ["chunk" buffer ..])= builds a Readable without
+interop; any Readable is piped with =application/octet-stream= unless =:type= says
+otherwise; a stream error before headers goes to the error chain, afterwards the
+connection is destroyed.
+
+Static files: =(route/static "/static" "/abs/root" {:dotfiles :ignore :max-age "1d"})=
+or =(mw/static root opts)= in a =:use= slot; misses fall through to the wrapper's
+404; dotfiles are ignored by default.
+
+* Routing as data
+Two equivalent input forms, freely mixed (=express-cljs.route=, pure — every
+validation error is an argument-error before any Express call):
+
+*Table form* — a map keyed by method / kind. Maps are unordered, so the table
+derives Express's registration order: kinds run =:param= → =:use= → =:routers= →
+method routes → =:resource= → =:error=, and within the method routes paths are
+sorted by *specificity* (segment by segment: literal < parameter < optional group
+< wildcard; a strict prefix first; equal shapes by path string; a specific method
+before =:all=; RegExps last). =/users/me= therefore always precedes =/users/:id=.
+
+#+begin_src clojure
+{:param   {"id" (fn [req value] (route/continue {:user (load value)}))}
+ :use     [(mw/json) ["/api" auth-mw]]
+ :routers [{:mount "/admin" :opts {:merge-params? true} :routes {...}}]
+ :get     {"/users/me" me  "/users/:id" user  "/files/*splat" [mw handler]}
+ :post    {"/users" create}
+ :resource {"/things" {:get list :post create}}     ; every other method → 405 + Allow
+ :error   [(fn [err req] nil)]}
+#+end_src
+
+*Ordered form* — =(route/routes entry ...)= or a plain vector, registered exactly
+in source order: =route/get post put patch delete head options query all=,
+=route/use=, =route/router=, =route/resource=, =route/static=, =route/param=,
+=route/error=, tuples =[:get "/p" h]= / =[:use "/p" mw]=, nested bundles and tables.
+
+Paths use Express 5 / path-to-regexp 8 syntax: =:id= params, ={/:id}= optional
+groups, =/*splat= named wildcards (a vector of segments), RegExp paths.
+=route/check-path= rejects the three Express 4 spellings with a clear message.
+
+*Flow control* — return values instead of =next= callbacks:
+- =nil= → =next()=;
+- =(route/continue {:user u} {:x-header v})= → =next()= while merging keys into
+  the request map every later handler sees (and setting response headers now);
+- =(route/next-route)= / =(route/next-router)= → Express =next('route')= /
+  =next('router')=.
+
+*Mounts* — =(route/router "/admin" {:merge-params? true :case-sensitive? .. :strict? ..} entries..)=
+mounts an Express Router: =:url= / =:path= are relative to the mount, =:base-url=
+keeps the prefix. Handler chains are vectors. =route/upstream= wraps a
+caller-supplied Express middleware function, =route/error-handler= an arity-4
+handler (chapter [[*Error handling][Error handling]]). =route/plan-paths= prints the registration table
+of a compiled plan; =route/compile= is the pure compiler =core/app= runs.
+
+* Middleware helpers
+Descriptors for Express's built-ins (validated option maps, instantiated by the
+binding): =mw/json=, =mw/urlencoded=, =mw/text=, =mw/raw= (body-parser 2.3:
+=:limit= default ="100kb"=, =:strict?=, =:inflate?=, =:type=, =:verify=,
+=:reviver= ...) and =mw/static= (serve-static 2.2). Malformed JSON answers 400
+=:parse-failed=, an over-limit body 413 =:too-large=, a non-matching content type
+is skipped silently (=:body nil=, pitfall 9.8).
+
+=mw/request-id= is an Express-layer helper that continues with =:request-id= in the
+request map and echoes the header.
+
+Ring-style wrappers over =(fn [req] -> response | nil | promise)= — they never see
+=req= / =res= and report their own failures as rejected promises:
+
+| Wrapper | Does |
+|---------+------|
+| =mw/wrap-json= | forces JSON bodies out; refuses non-JSON request bodies with 415 |
+| =mw/wrap-timing= | adds =x-response-time= |
+| =mw/wrap-logging= | one log line per request through =:log= |
+| =mw/wrap-errors->http-error= | converts foreign errors to http-errors with a controlled message |
+| =mw/wrap-require-header= | 400 when a header is missing / fails =:pred= |
+| =mw/wrap-bearer-auth= | =Authorization: Bearer= → =:verify= → =:auth= in the request map, 401 with =WWW-Authenticate= |
+| =mw/wrap-cors= | CORS headers as data, preflight 204 |
+| =mw/compose= / =mw/wrap-when= | composition |
+
+* WebSockets
+** serve!
+=(ws/serve! server opts)= attaches one websocket endpoint to a listening server
+handle and returns the ws-server value synchronously. The wrapper binds ONE Node
+=upgrade= listener per =http.Server= that dispatches by pathname across every
+=serve!= on that server and answers a raw HTTP 404 for the rest (Node accepts every
+upgrade once a listener exists, inventory 2.3). Options:
+
+| Option | Default | Meaning |
+|--------+---------+---------|
+| =:path= | ="/ws"= | string, set of strings, or predicate of the pathname |
+| =:authenticate= | — | =(fn [upgrade-map] -> ctx | promise | nil)=: nil / false → HTTP 401 before the handshake; a thrown http-error → its status; other throws → 500; a map becomes the connection's =:ctx= |
+| =:max-payload= | 1 MiB | over-limit frames close the peer with 1009 (pitfall 9.10) |
+| =:keepalive-ms= | 30000 | ping interval (=false= disables); peers that missed a pong are =terminate()=d; the interval is unref'd |
+| =:protocols= | — | vector of accepted subprotocol names (first client-offered accepted one wins) or =(fn [offered upgrade-map])= |
+| =:handshake-headers= | — | =(fn [upgrade-map] -> header map)= added to the 101 response (a =Set-Cookie=, for instance) |
+| =:per-message-deflate= | off | boolean or kebab option map |
+| =:close-timeout-ms= | 2000 | the wrapper's per-socket close deadline (then =terminate()=) |
+| =:max-buffered-bytes= | 8 MiB | =send!= rejects with =:backpressure= above it |
+| =:message-buffer= | 64 | IN channel size; a full buffer pauses the socket |
+| =:decode= | — | =:json= parses text frames eagerly (=:json= / =:json-error= on the message) |
+| =:shutdown-code= / =:shutdown-reason= | 1001 / ="server shutdown"= | what =close!= sends |
+| =:max-buffered-chunks= =:max-fragments= =:allow-synchronous-events= =:auto-pong= | ws defaults | passthrough |
+
+The upgrade request map is built by =core/upgrade-request->map=: the raw
+=IncomingMessage= gets Express's request prototype (what =app.handle= does), so
+=:ip=, =:query=, =:cookies= / =:signed-cookies=, =:host=, negotiation and the
+trust-proxy rules are exactly those of a route handler, with =:transport :ws= and
+no body.
+
+** Connection maps and channels
+A connection map is handed out for every accepted socket:
+={:id :ctx :remote-addr :remote-port :ip :headers :protocol (:ws | :wss)
+:subprotocol :upgrade <request map> :in <chan> :out <chan> :opened-at :server-id}=.
+Its metadata carries the socket, so every operation needs only the map.
+
+- =(ws/messages conn)= — the IN channel: ={:type :text :data "…"}= or ={:type
+  :binary :data <Buffer>}= (text is decoded; a Buffer sent by the peer arrives as a
+  binary frame, pitfall 9.21). Closed when the socket closes; closing it yourself
+  unsubscribes. When its buffer is full the socket is paused until the consumer
+  takes (receive backpressure).
+- =(ws/out conn)= — the OUT channel: everything put on it goes through =send!= in
+  order.
+- =(ws/send! conn data)= → promise of ={:bytes n}=: a string is a text frame, a
+  Buffer / Uint8Array / ArrayBuffer a binary frame, ={:text s}= / ={:binary b}= /
+  ={:json v}= explicit envelopes, any other value JSON. =ws/send-json!= and
+  =ws/send-binary!= are the explicit spellings. Rejections: ={:code :closed}=,
+  ={:code :backpressure :buffered-amount n}=.
+- =(ws/close! conn code reason {:timeout-ms ..})= → promise of the close event
+  ={:code :reason :forced?}=; codes are validated first (1000..1014 minus
+  1004/1005/1006, or 3000..4999; reason ≤ 123 bytes) and reported as
+  =:invalid-close-code= / =:invalid-close-reason= ws-errors. =ws/terminate!=
+  destroys the socket (both sides see 1006). =(ws/closed conn)= is the same promise
+  for anyone.
+- =(ws/ping! conn data? opts)= → promise of the round-trip milliseconds (ws
+  answers pings automatically on both sides).
+- =ws/ready-state=, =ws/open?=, =ws/buffered-amount=, =ws/ctx=, =ws/upgrade=.
+
+Message JSON: =ws/parse-json= / =ws/json= (keys as spelled; a ws-error
+=:invalid-json= on malformed input) and =ws/->json=.
+
+** Registry, events, topics, broadcast
+- =(ws/connections wsv)= — a sliding-buffer channel of ={:event :open :conn c}=,
+  ={:event :close :conn c :code :reason :forced?}=, ={:event :error :conn c
+  :error e}= (also handshake / auth failures with =:conn nil=). Consume promptly or
+  use the lossless callbacks =ws/on-open!= / =ws/on-close!= (each returns an
+  unsubscribe fn).
+- =ws/conns=, =ws/conn-count=, =ws/conn-by-id=.
+- Topics (rooms are a wrapper concept, inventory 6.10): =(ws/join! wsv conn
+  "room:1")=, =ws/leave!=, =(ws/topics wsv conn)=, =(ws/topic->conns wsv topic)=; a
+  closing connection leaves every topic.
+- =(ws/broadcast! wsv data)= to all, =(ws/broadcast! wsv topic-or-conns data
+  {:except conn})= to a topic / a collection; =ws/emit!= is the topic spelling. They
+  resolve ={:sent n :failed n :errors [..]}= — a closed peer never rejects a
+  broadcast.
+
+** Close codes and errors
+| Code | Who / when |
+|------+------------|
+| 1000 | normal (=close!= default) |
+| 1001 | =core/close!= / =ws/stop!= shutdown |
+| 1002 / 1007 | ws receiver on a framing / UTF-8 violation |
+| 1006 | =terminate!=, keepalive termination, and what the SERVER-side close event reports after a receiver error |
+| 1009 | what the CLIENT sees after a =:max-payload= violation (uncertainty 10.2, settled by the tests and the smoke) |
+| 3000–3002 | reserved by the RPC layer (3001 = =:strict?= protocol violation) |
+| 4000–4999 | application codes; reasons round-trip |
+
+Socket errors arrive as ={:event :error}= with a ws-error whose =:code= is the
+kebab =WS_ERR_*= name (=:unsupported-message-length=) and, for receiver errors,
+=:close-code= = what the peer receives (=ws/ws-error-close-codes=). The close event
+of a connection that errored carries the error under =:error=.
+
+** Keepalive and liveness
+The keepalive interval (README pattern of ws: mark, ping, terminate the silent) is
+one unref'd =setInterval= per ws-server, cleared by =stop!=. =ws/keepalive-stats=
+reports ={:pings :terminated}=. Nothing in the layer keeps the process alive after
+=core/close!=: the smoke build's exit hook prints an empty active-resource list.
+
+** stop! and the shutdown
+=serve!= registers a =core/add-close-hook!=, so =core/close!= runs the choreography
+of chapter [[*close! — the shutdown choreography][close!]]. =(ws/stop! wsv {:timeout-ms ..})= runs it alone (the HTTP
+server keeps serving; upgrades to the path get a 404 again) and resolves
+={:closed n :terminated n}=; it is idempotent.
+
+** Client side
+=(ws/connect! "ws://host/path" {:headers .. :protocols .. :max-payload ..
+:timeout-ms 5000 :decode :json})= resolves with a connection map that works with the
+same functions (=:client? true=, =:url=, =:subprotocol=, =:handshake-headers=, and an
+=:events= channel via =ws/events=). A handshake refused with an HTTP status rejects
+with ={:code :unexpected-response :status 401}=. The tests and the smoke are its
+first users; so is =rpc/client=.
+
+* The RPC layer
+** Registry
+#+begin_src clojure
+(def methods
+  (rpc/registry
+    {"math/add"  (fn [{:keys [a b]} _ctx] (+ a b))
+     "users/get" {:fn (fn [{:keys [id]} {:keys [user]}]
+                        (when-not user (throw (rpc/error :unauthorized "login first")))
+                        (db/user! id))                       ; a promise is fine
+                  :doc "one user" :timeout-ms 5000}}
+    {:introspection? true}))                                 ; adds rpc.methods
+#+end_src
+Names are non-empty strings; =rpc.*= is reserved. Built-ins: =rpc.ping= (answers
+={:pong true}=, =:ping? false= removes it) and, opt-in, =rpc.methods= (a vector of
+={:name :doc}=). =rpc/methods= and =rpc/method= introspect a registry value; the
+same value is passed to =http-routes= and =serve-ws!=.
+
+Methods are =(fn [params ctx] -> result | promise)=. =params= is the frame's params
+(a map with keys as spelled, a vector, or nil). Throw =(rpc/error code message
+data)= for a chosen JSON-RPC code; an argument-error becomes =-32602=; an
+http-error 401 / 403 becomes =-32001= / =-32002=; anything else =-32603= with the
+message hidden unless =:expose-errors?=. A method's =:timeout-ms= (or the dispatch
+option) turns a slow call into =-32003=.
+
+** Context injection
+| Transport | ctx seen by the method |
+|-----------+------------------------|
+| HTTP | ={:transport :http :request req-map :notify! nil}= merged with the =:context= fn's result, then =:id :method :notification? :params= |
+| ws | the connection's =:ctx= (the =:authenticate= result), the =:context= fn's result, then ={:transport :ws :conn conn :notify! f :id :method :notification? :params}= |
+
+** Frames
+Text frames and the =POST /rpc= body / response body are identical JSON-RPC 2.0
+documents; batches (arrays) are rejected with =-32600= and =data.batch? true=
+(uncertainty 10.13; the =:batch?= option is a reserved marker that only accepts
+=false=). Pure helpers: =rpc/request-frame=, =rpc/notification-frame=,
+=rpc/response-frame=, =rpc/error-frame=, the predicates =rpc/request?=
+=rpc/notification?= =rpc/response?= =rpc/error-response?=, =rpc/frame-id=,
+=rpc/check-frame= (validation), =rpc/error->frame= / =rpc/frame->error=.
+
+#+begin_src json
+{"jsonrpc":"2.0","id":1,"method":"math/add","params":{"a":1,"b":2}}
+{"jsonrpc":"2.0","id":1,"result":3}
+{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"method not found: x","data":{"method":"x"}}}
+{"jsonrpc":"2.0","method":"jobs/progress","params":{"id":3,"pct":50}}      ← notification (either direction)
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+#+end_src
+
+** Error codes
+| Wrapper code | JSON-RPC | HTTP status with =:status-map?= | Produced by |
+|--------------+----------+---------------------------------+-------------|
+| =:parse-error= | -32700 | 400 (always) | malformed JSON (HTTP body / ws text frame), id null |
+| =:invalid-request= | -32600 | 400 (always) | not an object, wrong =jsonrpc=, bad method / params / id, batch, binary frame |
+| =:method-not-found= | -32601 | 404 | unknown method |
+| =:invalid-params= | -32602 | 400 | =(rpc/error :invalid-params ..)=, argument-error |
+| =:internal-error= | -32603 | 500 | any other throw / rejection (message hidden unless =:expose-errors?=) |
+| =:unauthorized= / =:forbidden= | -32001 / -32002 | 401 / 403 | =(rpc/error ..)= or http-error 401 / 403 |
+| =:timeout= | -32003 | 504 | =:timeout-ms= exceeded |
+| =:application= | -32000 | 500 | =(rpc/error :application ..)=, other http-errors (=data.status=) |
+
+** Dispatch
+=(rpc/call! registry frame ctx opts)= is the one dispatcher both transports use:
+promise of the response frame, or nil for a notification (never answered — its
+errors go to =:on-error= only). Options: =:timeout-ms=, =:expose-errors?=,
+=:on-error (fn [err ctx])=, =:batch?= (marker).
+
+** HTTP: http-routes
+=(rpc/http-routes methods {:path "/rpc" :context (fn [req]) :limit "256kb"
+:status-map? false})= returns route entries to splice into =core/app=: a
+=route/resource= answering POST (other methods → 405 with =Allow=) behind a json body
+parser (non-strict, so scalars reach frame validation as -32600) and an error entry
+that turns body-parser failures into JSON-RPC transport frames.
+
+| Situation | HTTP status | Body |
+|-----------+-------------+------|
+| result or method error | 200 | result / error frame — the transport status is independent of the RPC outcome (inventory 7.2) |
+| method error with =:status-map? true= (or a ={code status}= map) | the table above | the same error frame |
+| notification | 204 | empty |
+| malformed JSON | 400 | -32700 frame, id null (a client fault; the body stays a valid JSON-RPC frame so one client code path suffices — the 2011 HTTP-transport draft's 500 was not followed) |
+| invalid request / batch | 400 | -32600 frame |
+| body over =:limit= | 413 | -32600 frame, =data.reason "body too large"= |
+| wrong / missing content type | 415 | -32600 frame |
+| a =:context= fn throwing an http-error | that status | the wrapper's error body (chapter [[*Error handling][Error handling]]) |
+
+** Websockets: serve-ws!
+=(rpc/serve-ws! wsv methods {:context (fn [conn]) :strict? false :on-open
+:on-close :timeout-ms :expose-errors? :on-error})= serves the registry on every
+connection of a =ws/serve!= endpoint: frames are dispatched concurrently (a slow
+method never blocks the next frame), request frames are answered on the same
+connection with the echoed id, notifications are dispatched and not answered,
+malformed JSON gets a -32700 frame with id null (or, with =:strict?=, the socket
+is closed with 3001), binary frames -32600. It owns the IN channel of every
+connection (use another endpoint for raw frames) and returns ={:ws-server
+:registry :stop!}=.
+
+** Notifications — the streaming primitive
+=(rpc/notify! conn "events/tick" params)= sends a server → client notification;
+=(rpc/broadcast-notify! wsv target method params)= to all / a topic / a list. A
+method streams by calling the =:notify!= of its ctx (nil over HTTP — check
+=:transport=) with the request =:id= in the params and returns the final result
+(inventory 7.6). Client → server notifications are frames without =id=.
+
+** Client
+=(rpc/client conn {:timeout-ms 10000 :on-notification f :id-prefix "req-"})= over
+any connection map returns ={:call! (fn [method params?]) :notify! :notifications
+<chan> :pending :close!}=: ids are counters, error frames reject with
+=rpc/frame->error= (keyword =:code=, =:data=), a missing answer rejects with
+=:timeout= (timers cancelled on arrival), and every pending call rejects with a
+ws-error =:closed= when the connection closes.
+
+* Error handling
+** Taxonomy
+Every error the library raises or normalises is an =ex-info= with =:type=
+(=util/error-data=, =util/error-type=, =util/error-status=):
+
+| Type | Data | Rendered as |
+|------+------+-------------|
+| =:express-cljs/http-error= | =:status :message :expose? :headers :body :reason :cause= | the status; message when =:expose?= (default true below 500) |
+| =:express-cljs/server-error= | =:code :message :op= | promise rejections (listen / close) or 500 (=:invalid-response=) |
+| =:express-cljs/ws-error= | =:code :close-code :conn-id :reason :cause= | =send!= / =close!= rejections, ={:event :error}= |
+| =:express-cljs/rpc-error= | =:code :message :data :id= | JSON-RPC error object |
+| =:express-cljs/argument-error= | validation before any upstream call | thrown synchronously; 400 inside a handler; -32602 inside a method |
+
+=core/->error= normalises foreign values: a JS Error with a 4xx / 5xx =status=
+(body-parser, serve-static, =res.format=) becomes an http-error with =:reason=
+from =err.type= (=:parse-failed=, =:too-large=, ...), other JS Errors become
+server-errors with the JS =code=, strings and falsy rejections too.
+
+** The chain and arity-4 handlers
+A handler's synchronous throw, rejected promise or thrown non-Error all reach
+Express's error chain as one ex-info (the adapter catches first; Express 5's own
+forwarding is the second net). Error handlers are =(fn [err req] -> response | nil
+| promise)= registered as arity-4 middleware where they appear: in a table's
+=:error= slot, with =(route/error "/api" f)=, or app-wide with the =:error-handler=
+option (run before the renderer). =nil= passes the error on, a response map
+answers, a throw replaces the error.
+
+The wrapper's final renderer (=util/error-response=, pure) answers
+={:error {:status :message :reason}}= as JSON when the client accepts JSON (or sent
+JSON), else =text/plain= =<status> <message>=, with =X-Content-Type-Options:
+nosniff=; foreign messages are shown only outside production (=:expose-errors?=).
+Every rendered error is emitted on =core/events= as ={:event :error :error e
+:status :method :path}= and passed to =:on-error= when given. The 404 layer
+(=core/not-found=) lets =OPTIONS= through so Express's automatic =Allow= answer
+works.
+
+* Design decisions
+- *Express 5.2.1, not 4.x* (inventory 1): the only line receiving features;
+  path-to-regexp 8 syntax; native async handler rejection forwarding (the wrapper
+  still catches first).
+- *Plain ws in noServer mode, express-ws rejected* (inventory 2): express-ws pins
+  ws 7, monkeypatches the Router prototype, owns the upgrade event, and can only
+  refuse a client after the 101. The wrapper's own upgrade listener authenticates
+  before the handshake with real HTTP statuses and shares the server with any
+  number of endpoints.
+- *Two binding namespaces, not one.* The inventory planned all interop in =core=;
+  the ws phase kept the =ws=-package interop in its own binding namespace
+  (=express-cljs.ws=) with the same house style, and =core= grew the one Express
+  seam it needs (=core/upgrade-request->map=). =route=, =middleware=, =rpc=, =util=
+  stay interop-free.
+- *JSON-RPC 2.0, single request, notifications, no batch* (inventory 7.1): any
+  existing client speaks it; batches add ordering / partial-failure semantics for no
+  benefit on a persistent socket. One =POST /rpc= endpoint rather than per-method
+  routes; HTTP 200 for method errors with an opt-in status map.
+- *Parse errors over HTTP are 400 with a -32700 body*: a client fault, and one
+  frame-shaped body for every outcome.
+- *Return-value sentinels instead of =next= callbacks* (=route/continue=,
+  =next-route=, =next-router=): handlers stay pure functions of the request map;
+  request enrichment is explicit data.
+- *Specificity ordering for table routes* (pitfall 9.30): a map has no source
+  order, so the table form sorts literal < param < optional < wildcard per segment;
+  the ordered form is registered verbatim.
+- *Lower-case kebab header keywords both ways* (uncertainty 10.1); user JSON is
+  never re-cased.
+- *=fresh?= as a helper, not a map key* (uncertainty 10.6) — and the Node =fetch=
+  pitfall: undici adds =Cache-Control: no-cache= to any request carrying a
+  conditional header, so =fresh= reports stale; send an explicit =Cache-Control=
+  from the client or use =http.get= (pitfall 9.27).
+- *Connections channel is sliding, hooks are lossless*: events are optional to
+  consume (like =core/events=), so the channel drops the oldest under pressure;
+  =ws/on-open!= / =ws/on-close!= exist for code that must not miss a connection
+  (the RPC layer uses them).
+- *The wrapper's deadline wins over ws's =closeTimeout=* (uncertainty 10.17):
+  =close!= arms an unref'd timer and =terminate()=s; ws guards against a second
+  close event — verified by =close-terminates-an-unresponsive-client-once=.
+- *Keepalive timers are unref'd* (email-cljs precedent, inventory 6.7): an idle
+  process exits on its own; the smoke proves it.
+- *Promesa 12.0.1 with a vendored one-line patch.* Promesa 12's ClojureScript
+  promise implementation (=promesa/impl/promise.js=, =processNextTick=) lets a
+  synchronous throw inside one =p/do= / =p/let= body flip the drain state for every
+  later continuation queued on its shared null-promise singleton in the same
+  microtask drain; those continuations then resolve with =nil= without running.
+  Any two concurrent handlers where one throws could silently skip the other
+  (found by the websocket RPC tests, reproduced with three lines of promesa,
+  pinned by =util-test/promesa-drain-is-not-poisoned-by-a-throwing-body=).
+  =src/promesa/impl/promise.js= is a copy of the upstream file that re-reads the
+  promise's state per task; the source path precedes the jar on the classpath, so
+  it shadows the jar's copy for the library and for =:local/root= consumers.
+  Promesa 11.0.678 drains correctly but changes other semantics (four existing
+  tests fail on it), so the patch was preferred over a downgrade; remove it when
+  upstream ships a fix.
+- *A paused ws socket never emits =close=* (its receiver stops draining): the
+  tests resume before awaiting a close; production code should =terminate!=
+  instead of pausing a socket it intends to close.
+
+* Testing and the smoke
+- =./run-tests.sh= compiles the =:node-test= build and runs it: 127 tests / 1027
+  assertions across =util=, =route=, =middleware=, =core=, =ws=, =rpc= (about 4 s
+  of test time after the shadow-cljs compile). Server tests listen on ephemeral
+  127.0.0.1 ports and close them; every websocket test uses =ws/connect!=;
+  =EXPRESS_CLJS_TRACE=1= prints each async test as it starts and ends. The only
+  test file with interop is =test/express_cljs/test_util.cljs= (fetch, the raw
+  socket pause / resume fixtures, the process resource probe, the =cookie-signature=
+  oracle).
+- Two recurring test pitfalls: =p/let= awaits every promise binding (bind an
+  in-flight call with a vector, =[pending] [(call ..)]=, pitfall 9.28), and a
+  timed-out =take!= leaves a taker on the channel (=tu/take-with-timeout= uses
+  =alts!=).
+- =npx shadow-cljs compile smoke && node target/smoke.js= runs
+  =dev/express_cljs/smoke.cljs=: one real server with HTTP routes (JSON, cookies,
+  signed cookies, redirect, static, 404, 405, streaming), three websocket endpoints
+  (echo / topics / broadcast / binary / ping / close codes / maxPayload 1009),
+  RPC over HTTP (200 for method errors, 400 + -32700 for bad JSON, batch, status
+  map, 204 notifications, 405) and over websockets (concurrent correlation,
+  notifications both ways, server push), the same registry on both transports,
+  authentication, and a full =close!= with clients and a pending call; 67 numbered
+  checks, a tally, the exit code — and no =process.exit=: the exit hook prints
+  ="process exited by itself after N ms … active resources at exit: []"=.
+- =dev/api-index.sh --check= verifies that every public var has a docstring and
+  is referenced in this manual; =dev/api-index.sh --org= regenerates the chapter
+  below.
+- =node dev/liveness.js= runs the unit suite with =process.exit= neutralised: the
+  process must drain by itself.
+
+* API reference
+Generated by =dev/api-index.sh --org= (first docstring line of every public var;
+the docstrings themselves are the full truth).
+# API-INDEX-BEGIN (regenerate: dev/api-index.sh --org)
+*** =express-cljs.core=
+- =express-cljs.core/buffer?= :: True for a Node Buffer or any Uint8Array (opaque binary body).
+- =express-cljs.core/readable?= :: True for a Node Readable stream (an opaque streaming :body, uncertainty
+- =express-cljs.core/readable-from= :: A Node Readable over a seq of strings and/or Buffers (`Readable.from`),
+- =express-cljs.core/methods= :: The set of lower-case method keywords this Node exposes (http.METHODS,
+- =express-cljs.core/->error= :: Normalises any thrown / rejected value into an express-cljs ex-info
+- =express-cljs.core/http-error= :: Re-export of util/http-error: `(throw (http-error 404 "no such user"))`
+- =express-cljs.core/parse-cookies= :: `Cookie` header string -> {name-keyword value-string}: pairs split on
+- =express-cljs.core/cookie-sign= :: `value.<base64 HMAC-SHA256(secret, value) without trailing =>` —
+- =express-cljs.core/cookie-unsign= :: Inverse of cookie-sign: the original value when the signature verifies
+- =express-cljs.core/cookies-and-signed= :: Splits parsed cookies into [:cookies :signed-cookies] the way
+- =express-cljs.core/cookie-option-keys= :: res.cookie options (inventory 5.2): :max-age (ms), :expires (js/Date,
+- =express-cljs.core/req->map= :: Builds the kebab request map (inventory 11.3) for the current layer:
+- =express-cljs.core/upgrade-request->map= :: The request map of an HTTP `upgrade` request (the websocket handshake,
+- =express-cljs.core/with-raw= :: Escape hatch: calls `(f raw-req raw-res)` with the Node / Express
+- =express-cljs.core/accepts?= :: Content negotiation over the Accept header (req.accepts): given one or
+- =express-cljs.core/is?= :: req.is: the matched type string when the request body's Content-Type
+- =express-cljs.core/range= :: req.range: parses the Range header against `size` bytes. Returns
+- =express-cljs.core/fresh?= :: The `fresh` algorithm behind req.fresh (inventory 5.1, uncertainty 10.6)
+- =express-cljs.core/stale?= :: (not (fresh? req res-headers)).
+- =express-cljs.core/respond!= :: Executes a response map against `res` exactly once (inventory 5.2):
+- =express-cljs.core/not-found= :: The wrapper's final 404 middleware as a handler: throws an http-error
+- =express-cljs.core/setting= :: Reads an Express app setting by kebab keyword (`:trust-proxy`, `:env`,
+- =express-cljs.core/set-setting!= :: Sets an Express app setting by kebab keyword; keyword values render as
+- =express-cljs.core/app= :: Builds an Express 5 application from options and any number of route
+- =express-cljs.core/finalize!= :: Appends the wrapper's final layers — the app's :error-handler (if any),
+- =express-cljs.core/mount-upstream!= :: Appends a caller-supplied Express middleware function `(req, res, next)`
+- =express-cljs.core/handler= :: The Express application as a Node request listener `(req, res)`, after
+- =express-cljs.core/listen-option-keys= :: listen! options: :port (0 = ephemeral), :host (default: all
+- =express-cljs.core/address= :: {:address "127.0.0.1" :family "IPv4" :port 43210} of a listening
+- =express-cljs.core/listening?= :: True while the server accepts connections.
+- =express-cljs.core/connections!= :: Promise of the number of open connections (server.getConnections).
+- =express-cljs.core/events= :: The app's core.async channel of lifecycle events (inventory 11.5):
+- =express-cljs.core/add-close-hook!= :: Registers `(fn [{:keys [timeout-ms]}] -> promise | any)` to run at the
+- =express-cljs.core/listen!= :: Starts an http.Server for `app` (created here, not by app.listen, so the
+- =express-cljs.core/close-option-keys= :: close! options: :timeout-ms (default 5000: after it, in-flight HTTP
+- =express-cljs.core/close!= :: Graceful shutdown (inventory 5.3 house choreography): (1) run the close
+
+*** =express-cljs.middleware=
+- =express-cljs.middleware/body-parser-option-keys= :: Options every body parser accepts (kebab, `?` stripped): :limit
+- =express-cljs.middleware/parser-option-keys= :: Per-parser option whitelists (inventory 4.1 table).
+- =express-cljs.middleware/json= :: express.json descriptor: parses `application/json` bodies into :body
+- =express-cljs.middleware/urlencoded= :: express.urlencoded descriptor: `application/x-www-form-urlencoded` ->
+- =express-cljs.middleware/text= :: express.text descriptor: `text/plain` -> :body string. Options: :limit,
+- =express-cljs.middleware/raw= :: express.raw descriptor: `application/octet-stream` -> :body Buffer
+- =express-cljs.middleware/static-option-keys= :: express.static options (inventory 4.1): :accept-ranges?, :cache-control?,
+- =express-cljs.middleware/static= :: express.static descriptor serving files below `root` (an absolute
+- =express-cljs.middleware/request-id= :: Middleware that gives every request an id: reuses the incoming header
+- =express-cljs.middleware/compose= :: Composes wrappers right-to-left like `comp`: `((compose wrap-a wrap-b)
+- =express-cljs.middleware/wrap-when= :: Applies `wrapper` only to requests satisfying `pred` (a fn of the request
+- =express-cljs.middleware/wrap-json= :: Forces JSON: every non-nil, non-control response body is rendered with
+- =express-cljs.middleware/wrap-timing= :: Adds an `x-response-time` header ("12.3ms") to map responses; nil /
+- =express-cljs.middleware/wrap-logging= :: Logs one line per handled request through `:log` (a fn of a map, default
+- =express-cljs.middleware/wrap-errors->http-error= :: Converts every non-http error escaping `handler` into an http-error so
+- =express-cljs.middleware/wrap-require-header= :: Answers 400 (or `:status`) when request header `header` (kebab keyword)
+- =express-cljs.middleware/wrap-bearer-auth= :: Bearer-token authentication: `:verify` is `(fn [token] -> ctx-map | nil
+- =express-cljs.middleware/wrap-cors= :: Adds CORS headers as data: :origins (vector of allowed origins or
+
+*** =express-cljs.route=
+- =express-cljs.route/methods= :: The lower-case method keywords Express 5 exposes on Node 22 (inventory
+- =express-cljs.route/table-kinds= :: Non-method keys a table may carry, in registration order.
+- =express-cljs.route/next-route= :: Return this from a handler to skip the remaining handlers of the current
+- =express-cljs.route/next-router= :: Return this from a handler to leave the current router and continue in
+- =express-cljs.route/continue= :: Return this from a handler / param loader to call next() while merging
+- =express-cljs.route/control?= :: True for a value produced by next-route / next-router / continue.
+- =express-cljs.route/descriptor?= :: True for a middleware descriptor map: a built-in (`{:express-cljs/builtin
+- =express-cljs.route/handler?= :: True for anything that may sit in a handler position: a function or a
+- =express-cljs.route/error-handler= :: Descriptor for an error handler `(fn [err req] -> response-map | nil |
+- =express-cljs.route/upstream= :: Descriptor for a caller-supplied Express middleware function
+- =express-cljs.route/check-path= :: Validates a route path before it reaches path-to-regexp 8 (inventory
+- =express-cljs.route/specificity= :: Sort key of a route path for the table form: the vector of segment ranks
+- =express-cljs.route/specificity-compare= :: Comparator over two `specificity` keys: rank vectors lexicographically
+- =express-cljs.route/route= :: Generic route entry: `(route :get "/x" mw handler)` -> {:op :route
+- =express-cljs.route/get= :: GET route entry (see `route`).
+- =express-cljs.route/post= :: POST route entry (see `route`).
+- =express-cljs.route/put= :: PUT route entry (see `route`).
+- =express-cljs.route/patch= :: PATCH route entry (see `route`).
+- =express-cljs.route/delete= :: DELETE route entry (see `route`).
+- =express-cljs.route/head= :: HEAD route entry (see `route`).
+- =express-cljs.route/options= :: OPTIONS route entry (see `route`).
+- =express-cljs.route/query= :: QUERY route entry (see `route`; uncertainty 10.15).
+- =express-cljs.route/all= :: Entry matching every method (Express app.all).
+- =express-cljs.route/use= :: Middleware entry: `(use mw ...)` mounts at "/", `(use "/api" mw ...)`
+- =express-cljs.route/router-option-keys= :: Options of a nested router (inventory 1.3): :merge-params?,
+- =express-cljs.route/router= :: Nested router entry mounted at `path`: `(router "/admin" {:merge-params?
+- =express-cljs.route/resource= :: One path with per-method handlers and an automatic 405 for every other
+- =express-cljs.route/param= :: Parameter pre-loader (Express app.param / router.param, inventory 3.2):
+- =express-cljs.route/error= :: Error-handler entry: `(error f ...)` or `(error "/api" f ...)`; each `f`
+- =express-cljs.route/static= :: Static file entry (express.static, inventory 4.1): `(static "/static"
+- =express-cljs.route/routes= :: Ordered bundle of entries (tables, constructors, tuples, nested bundles),
+- =express-cljs.route/op?= :: True for a compiled registration op ({:op :route ...} etc.).
+- =express-cljs.route/compile= :: Compiles any number of route sources into the flat registration plan
+- =express-cljs.route/plan-paths= :: Introspection: [[method-or-kind path] ...] of a compiled plan in
+
+*** =express-cljs.rpc=
+- =express-cljs.rpc/version= :: The `jsonrpc` member every frame carries.
+- =express-cljs.rpc/error= :: `(error code message data?)` — `util/rpc-error`: an ex-info whose :code
+- =express-cljs.rpc/valid-id?= :: JSON-RPC ids are strings, numbers or null.
+- =express-cljs.rpc/request-frame= :: `{:jsonrpc "2.0" :id id :method method :params params}` (params omitted
+- =express-cljs.rpc/notification-frame= :: A request frame without :id — the server MUST NOT answer it.
+- =express-cljs.rpc/response-frame= :: `{:jsonrpc "2.0" :id id :result result}` (result may be nil -> JSON null;
+- =express-cljs.rpc/error-frame= :: `{:jsonrpc "2.0" :id id :error {:code n :message s :data d}}`; `code` is
+- =express-cljs.rpc/request?= :: True for a frame carrying :method (request or notification).
+- =express-cljs.rpc/notification?= :: True for a request frame without an :id member.
+- =express-cljs.rpc/response?= :: True for a frame carrying :result or :error.
+- =express-cljs.rpc/error-response?= :: True for a response frame carrying :error.
+- =express-cljs.rpc/frame-id= :: The :id a response to `frame` must echo: the frame's id when it is a
+- =express-cljs.rpc/check-frame= :: Validates a parsed request frame (inventory 7.1, spec §4): a JSON
+- =express-cljs.rpc/error-data= :: The `data` member an express-cljs error contributes to an error frame:
+- =express-cljs.rpc/error->frame= :: Any thrown / rejected value from a method -> the JSON-RPC error frame
+- =express-cljs.rpc/frame->error= :: Inverse of `error->frame` for clients: the :error object of a response
+- =express-cljs.rpc/method-option-keys= :: Per-method entry keys: :fn (required), :doc, :timeout-ms.
+- =express-cljs.rpc/registry-option-keys= :: registry options: :introspection? (adds `rpc.methods`, default false),
+- =express-cljs.rpc/registry?= :: True for a value built by `registry`.
+- =express-cljs.rpc/registry= :: Builds the method registry from `{"name" (fn [params ctx]) ...}` or
+- =express-cljs.rpc/methods= :: Sorted vector of `{:name :doc}` for every method in the registry.
+- =express-cljs.rpc/method= :: The registry entry `{:name :fn :doc :timeout-ms}` for `name`, or nil.
+- =express-cljs.rpc/call-option-keys= :: call! / http-routes / serve-ws! dispatch options: :timeout-ms (default
+- =express-cljs.rpc/call!= :: Dispatches ONE parsed request frame against the registry and resolves
+- =express-cljs.rpc/http-option-keys= :: http-routes options: :path (default "/rpc"), :context (fn [req-map] ->
+- =express-cljs.rpc/error-status= :: The HTTP status for an error frame under a :status-map option (false ->
+- =express-cljs.rpc/http-handler= :: The `(fn [req-map] -> response-map)` behind `http-routes`, exposed for
+- =express-cljs.rpc/http-routes= :: Route entries mounting the registry at `:path` (default "/rpc") as ONE
+- =express-cljs.rpc/notify!= :: Server -> client notification: sends `{:jsonrpc "2.0" :method method
+- =express-cljs.rpc/broadcast-notify!= :: Sends a notification frame to every connection of a ws-server (`:all`),
+- =express-cljs.rpc/ws-option-keys= :: serve-ws! options: :context (fn [conn] -> map | promise, merged into
+- =express-cljs.rpc/serve-ws!= :: Serves the registry on every connection of a `ws/serve!` ws-server:
+- =express-cljs.rpc/client-option-keys= :: client options: :timeout-ms (per call, default 10000), :on-notification
+- =express-cljs.rpc/client= :: A JSON-RPC client over a connection map (typically from `ws/connect!`):
+
+*** =express-cljs.util=
+- =express-cljs.util/kebab->camel= :: "max-age" -> "maxAge". Keywords render as their name (the namespace is
+- =express-cljs.util/camel->kebab= :: "maxAge" -> :max-age, "perMessageDeflate" -> :per-message-deflate.
+- =express-cljs.util/transform-keys= :: Recursively applies `f` to every map key in `x` (maps inside vectors/lists
+- =express-cljs.util/option-passthrough-keys= :: Kebab keys whose subtree is handed upstream verbatim: user data and
+- =express-cljs.util/->camel-keys= :: Kebab keyword option map -> string-keyed camelCase map, nil values
+- =express-cljs.util/->kebab-keys= :: Deeply translates camelCase string/keyword keys (as js->clj yields them)
+- =express-cljs.util/enum-value= :: Keyword enum value -> upstream string (:lax -> "lax", :same-origin ->
+- =express-cljs.util/kebab->setting= :: ":trust-proxy" -> "trust proxy", :x-powered-by -> "x-powered-by"
+- =express-cljs.util/setting->kebab= :: "trust proxy" -> :trust-proxy, "x-powered-by" -> :x-powered-by.
+- =express-cljs.util/header-name= :: Header keyword or string -> the lower-case wire name (:Content-Type ->
+- =express-cljs.util/header-keyword= :: Wire header name -> lower-case kebab keyword ("Content-Type" ->
+- =express-cljs.util/->header-map= :: {"Content-Type" "text/plain"} -> {:content-type "text/plain"}. Values
+- =express-cljs.util/->wire-headers= :: {:content-type "text/plain" :x-nil nil} -> {"content-type"
+- =express-cljs.util/reason-phrases= :: IANA status code -> reason phrase for the codes the wrapper emits or
+- =express-cljs.util/reason-phrase= :: "Not Found" for 404; the number as a string for unknown codes.
+- =express-cljs.util/valid-status?= :: True for an integer in 100..599.
+- =express-cljs.util/strip-question-mark= :: `:case-sensitive?` -> :case-sensitive. Keywords keep their namespace;
+- =express-cljs.util/normalize-opts= :: Strips the `?` suffix from every top-level keyword key of `opts` and
+- =express-cljs.util/check-opts!= :: Throws an argument-error when `opts` (already normalised) is not a map or
+- =express-cljs.util/error-types= :: Every :type an express-cljs ex-info can carry.
+- =express-cljs.util/http-error= :: ex-info for an HTTP error response. `status` must be 400..599 (an
+- =express-cljs.util/server-error= :: ex-info for a server lifecycle or transport failure (listen EADDRINUSE,
+- =express-cljs.util/ws-error= :: ex-info for a websocket failure. `code` is a close code (1000..4999) or
+- =express-cljs.util/rpc-error-codes= :: RPC error keyword -> the JSON-RPC 2.0 numeric code it maps to on the wire
+- =express-cljs.util/rpc-error= :: ex-info for an RPC failure. `code` is one of the rpc-error-codes keys
+- =express-cljs.util/argument-error= :: ex-info for an invalid argument detected before any upstream call.
+- =express-cljs.util/error-data= :: Returns the structured data of an express-cljs error, or nil when `e` is
+- =express-cljs.util/error-type= :: One of the express-cljs error :type keywords (see error-types) or nil.
+- =express-cljs.util/error-status= :: The HTTP status to answer with for any thrown value: the :status of an
+- =express-cljs.util/rpc-error-code= :: The keyword :code of an rpc-error, nil otherwise.
+- =express-cljs.util/trust-proxy-setting= :: Translates the wrapper's `:trust-proxy` spellings (inventory 10.7) into
+- =express-cljs.util/app-option-keys= :: Every option `core/app` accepts (kebab, `?` stripped). The first group
+- =express-cljs.util/app-settings= :: Pure translation of the Express-setting subset of `core/app` options
+- =express-cljs.util/body-parser-reasons= :: body-parser `err.type` -> wrapper `:reason` keyword (inventory 4.1).
+- =express-cljs.util/upstream-reason= :: The wrapper `:reason` for an upstream http-error `type` string: the 4.1
+- =express-cljs.util/response-body-keys= :: Response map keys that decide *how* the response ends; at most one may be
+- =express-cljs.util/response-keys= :: Every key a response map may carry (inventory 11.4).
+- =express-cljs.util/check-response!= :: Validates a handler's response map before the binding touches `res`:
+- =express-cljs.util/accepts-json?= :: Content negotiation for the wrapper's own error bodies (inventory 8.5):
+- =express-cljs.util/error-response= :: Renders any thrown value as a response map (inventory 8.5), without
+
+*** =express-cljs.ws=
+- =express-cljs.ws/ready-states= :: ws readyState number -> keyword.
+- =express-cljs.ws/->json= :: Serialises a CLJS value as a JSON string (keywords render as their
+- =express-cljs.ws/parse-json= :: Parses a JSON string into CLJS data with keys keywordised AS SPELLED
+- =express-cljs.ws/json= :: Alias of `parse-json` (inventory 12.4 name).
+- =express-cljs.ws/valid-close-code?= :: RFC 6455 codes ws accepts in `close(code)`: 1000..1014 except 1004 /
+- =express-cljs.ws/ws-error-close-codes= :: The close code ws sends to the peer after a receiver error, by the
+- =express-cljs.ws/->ws-error= :: A JS error from a socket 'error' event -> ws-error ex-info {:code
+- =express-cljs.ws/ready-state= :: One of :connecting :open :closing :closed.
+- =express-cljs.ws/open?= :: True while frames can be sent.
+- =express-cljs.ws/buffered-amount= :: Bytes queued on the socket and not yet flushed (inventory 6.8).
+- =express-cljs.ws/messages= :: The connection's IN channel: `{:type :text :data ".."}` or `{:type
+- =express-cljs.ws/out= :: The connection's OUT channel: every value put on it goes through
+- =express-cljs.ws/ctx= :: The context the `:authenticate` function returned for this connection
+- =express-cljs.ws/upgrade= :: The upgrade request map (headers, cookies, query, ip, ... — see
+- =express-cljs.ws/closed= :: Promise resolved with `{:code n :reason s :forced? bool}` when the
+- =express-cljs.ws/send!= :: Sends one frame; resolves `{:bytes n}` when the socket has written it.
+- =express-cljs.ws/send-json!= :: Sends any CLJS value as a JSON text frame (see `send!`).
+- =express-cljs.ws/send-binary!= :: Sends a Buffer / Uint8Array / ArrayBuffer as a binary frame (see `send!`).
+- =express-cljs.ws/close!= :: Starts the closing handshake with `code` (default 1000) and `reason`
+- =express-cljs.ws/terminate!= :: Destroys the socket immediately (both sides see 1006). Resolves with the
+- =express-cljs.ws/ping!= :: Sends a ping frame and resolves with the round-trip time in
+- =express-cljs.ws/connections= :: The ws-server's core.async channel of connection events: `{:event :open
+- =express-cljs.ws/conns= :: Vector of the currently registered (accepted, not yet closed)
+- =express-cljs.ws/conn-count= :: Number of registered connections.
+- =express-cljs.ws/conn-by-id= :: The connection map with this :id, or nil.
+- =express-cljs.ws/on-open!= :: Registers `(fn [conn])`, called synchronously for every accepted
+- =express-cljs.ws/on-close!= :: Registers `(fn [conn {:keys [code reason forced?]}])`, called for every
+- =express-cljs.ws/join!= :: Adds the connection to `topic` (a string or keyword; rooms are a
+- =express-cljs.ws/leave!= :: Removes the connection from `topic`. Returns the remaining member count.
+- =express-cljs.ws/topics= :: The set of topic names a connection has joined (or, with one argument,
+- =express-cljs.ws/topic->conns= :: Vector of the connection maps in `topic`.
+- =express-cljs.ws/broadcast!= :: Sends `data` (any `send!` payload) to every open connection (`:all` or
+- =express-cljs.ws/emit!= :: `(broadcast! ws-server topic data opts)` — the topic-oriented spelling.
+- =express-cljs.ws/serve-option-keys= :: serve! options (kebab, `?` stripped): :path (string, set of strings or
+- =express-cljs.ws/keepalive-stats= :: {:pings n :terminated n} — pings sent by the keepalive interval and
+- =express-cljs.ws/serve!= :: Attaches a websocket endpoint to a listening `core/listen!` server
+- =express-cljs.ws/stop!= :: Shuts the websocket endpoint down (inventory 5.3 choreography, run by
+- =express-cljs.ws/connect-option-keys= :: connect! options: :headers (kebab map sent with the handshake),
+- =express-cljs.ws/events= :: A CLIENT connection's channel of `{:event :close ..}` / `{:event :error
+- =express-cljs.ws/connect!= :: Opens a websocket to `url` (ws:// or wss://) with the `ws` client and
+# API-INDEX-END

@@ -1,12 +1,17 @@
 ;; shadow-cljs configuration for express-cljs.
 ;; Standalone (no :deps) so `npx shadow-cljs ...` only needs Java + node_modules.
-;; promesa (pure ClojureScript, no npm package) is resolved from Clojars by the
-;; standalone shadow-cljs CLI via the :dependencies key below; deps.edn mirrors
-;; the same dependencies for consumers using :local/root / git deps.
-;; core.async ships with shadow-cljs itself (the core events channel today; the
-;; per-socket message channels of express-cljs.ws in the websocket phase).
-;; The `express` / `ws` npm packages are required at runtime by the single binding
-;; namespace (Phase 2); shadow's :node-* targets leave npm requires external.
+;; promesa (no npm package) is resolved from Clojars by the standalone shadow-cljs
+;; CLI via the :dependencies key below; deps.edn mirrors the same dependencies
+;; for consumers using :local/root / git deps.
+;; PATCH: src/promesa/impl/promise.js is a copy of promesa 12.0.1's ClojureScript
+;; promise implementation with a one-line fix in processNextTick (upstream lets a
+;; synchronous throw inside one p/do / p/let body flip the drain state for every
+;; later continuation queued on its shared null-promise singleton in the same
+;; tick — those then resolve with nil WITHOUT running: concurrent handlers were
+;; silently skipped; found by the ws RPC tests, reproduced standalone, pinned by
+;; util-test/promesa-drain-is-not-poisoned-by-a-throwing-body). The source path
+;; precedes the jar on the classpath, so this copy shadows the jar's file; drop it
+;; once upstream ships the fix (promesa 11.0.678 had the correct `const state`).
 {:source-paths ["src" "test" "dev"]
  :dependencies [[funcool/promesa "12.0.1"]]
  :builds
@@ -17,6 +22,14 @@
               :output-to "target/node-test.js"
               :ns-regexp "-test$"
               :autorun true}
+
+  ;; Phase 5 localhost smoke: a real 127.0.0.1 server (HTTP + ws + RPC over both)
+  ;; exercised end to end, numbered PASS/FAIL lines + tally; the process must
+  ;; exit BY ITSELF (no process.exit) — liveness is part of the check.
+  ;;   npx shadow-cljs compile smoke && node target/smoke.js
+  :smoke {:target :node-script
+          :main express-cljs.smoke/main
+          :output-to "target/smoke.js"}
 
   ;; Interactive development build for a Node REPL:
   ;;   npx shadow-cljs watch dev          ; terminal 1: compiles + hot reloads

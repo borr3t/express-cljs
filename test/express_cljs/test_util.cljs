@@ -5,7 +5,8 @@
    global `fetch`), the raw-socket helper, the process resource probe and
    the dev-only `cookie-signature` byte-compatibility oracle live here so
    the test namespaces stay interop-free."
-  (:require [cljs.test :refer [is] :as ct]
+  (:require [cljs.core.async :as async]
+            [cljs.test :refer [is] :as ct]
             [clojure.string :as str]
             [goog.object :as gobj]
             [promesa.core :as p]
@@ -173,3 +174,86 @@
         (js-invoke fs "writeFileSync" full content)))
     dir))
 
+
+;; ---------------------------------------------------------------------------
+;; Phase 4 additions: websocket test seams (interop stays here)
+;; ---------------------------------------------------------------------------
+
+(defn ws-url
+  "ws://127.0.0.1:<port><path> of a server handle."
+  [server path]
+  (str "ws://127.0.0.1:" (:port (core/address server)) path))
+
+(defn js-error-with-code
+  "A JS Error carrying a `code` property (to exercise the WS_ERR_* mapping)."
+  [msg code]
+  (let [e (js/Error. msg)]
+    (gobj/set e "code" code)
+    e))
+
+(defn pause-socket!
+  "Stops a connection's underlying socket from reading (the peer's close
+   frame is never seen, so the closing handshake cannot complete) — the
+   'unresponsive peer' fixture for the shutdown deadline tests."
+  [conn]
+  (js-invoke (:ws (:express-cljs/raw (meta conn))) "pause")
+  conn)
+
+(defn resume-socket!
+  "Undoes pause-socket!. NB: a paused ws socket never emits 'close' (the
+   receiver stops draining), so resume before awaiting its close."
+  [conn]
+  (js-invoke (:ws (:express-cljs/raw (meta conn))) "resume")
+  conn)
+
+(defn string-of-bytes
+  "An ASCII string of `n` bytes."
+  [n]
+  (js-invoke (js-invoke js/Buffer "alloc" n 120) "toString" "utf8"))
+
+(defn take-with-timeout
+  "Promise of the next value of core.async channel `ch`, ::closed when it
+   closes, or ::timeout after `ms` (default 2000) — so a test never hangs
+   on a channel that stays silent. Uses alts! so a timed-out take is
+   cancelled (a stale taker would steal the next value)."
+  ([ch] (take-with-timeout ch 2000))
+  ([ch ms]
+   (p/create (fn [resolve _]
+               (async/go
+                 (let [[v port] (async/alts! [ch (async/timeout ms)])]
+                   (resolve (cond (not= port ch) ::timeout (nil? v) ::closed :else v))))))))
+
+(defn drain-until-closed
+  "Promise of ::closed once `ch` closes (buffered values are discarded),
+   or ::timeout when a take waits longer than `ms`."
+  ([ch] (drain-until-closed ch 200))
+  ([ch ms]
+   (p/loop []
+     (p/let [v (take-with-timeout ch ms)]
+       (if (or (= ::closed v) (= ::timeout v)) v (p/recur))))))
+
+(defn collect
+  "Promise of the next `n` values taken from `ch` (each within `ms`)."
+  ([ch n] (collect ch n 2000))
+  ([ch n ms]
+   (p/loop [acc [] i n]
+     (if (zero? i)
+       acc
+       (p/let [v (take-with-timeout ch ms)]
+         (p/recur (conj acc v) (dec i)))))))
+
+(defn set-exit-code!
+  "process.exitCode = n (the process still exits by itself once the event
+   loop drains — the smoke's liveness evidence)."
+  [n]
+  (gobj/set js/process "exitCode" n))
+
+(defn on-exit!
+  "Registers `(fn [code])` on process 'exit'."
+  [f]
+  (js-invoke js/process "on" "exit" (fn [code] (f code))))
+
+(defn now-ms
+  "Date.now()."
+  []
+  (js/Date.now))

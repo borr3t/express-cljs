@@ -331,6 +331,26 @@
         (cond-> (map? ctx) (merge ctx))
         (with-meta {:express-cljs/raw {:req req :res res}}))))
 
+(defn upgrade-request->map
+  "The request map of an HTTP `upgrade` request (the websocket handshake,
+   inventory 2.3 / uncertainty 10.9). The raw Node IncomingMessage is not
+   an Express request, so `req.ip`, `req.query`, `req.host` and the
+   negotiation helpers do not exist on it; this gives it Express's request
+   prototype (`Object.setPrototypeOf(req, app.request)`, exactly what
+   `app.handle` does) and then builds the same map `req->map` builds for a
+   route handler — trust-proxy, cookie and signed-cookie rules included —
+   with :transport :ws, no :body / :params / :route and no `res` behind it
+   (`with-raw` receives nil for res). Used by express-cljs.ws before the
+   handshake completes, so `:authenticate` sees the full request map."
+  [app req]
+  (js-invoke js/Object "setPrototypeOf" req (jsget (:express app) "request"))
+  (let [m (req->map app req nil)]
+    (-> m
+        (assoc :transport :ws
+               :original-url (or (:original-url m) (:url m))
+               :params {}
+               :body nil))))
+
 (defn with-raw
   "Escape hatch: calls `(f raw-req raw-res)` with the Node / Express
    objects behind a request map (for a caller-mounted multer etc.,

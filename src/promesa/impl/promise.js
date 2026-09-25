@@ -1,0 +1,508 @@
+"use strict";
+// PATCHED COPY of promesa 12.0.1 promesa/impl/promise.js (BSD-2-Clause,
+// (c) Andrey Antukh). One semantic change, marked "express-cljs patch" in
+// processNextTick; everything else is verbatim. Lives on the source path so it
+// shadows the jar's copy (see shadow-cljs.edn). Remove when upstream fixes it.
+
+goog.provide("promesa.impl.promise");
+goog.provide("promesa.impl.promise.PromiseImpl");
+goog.provide("promesa.impl.promise.CancellationError");
+
+goog.scope(function() {
+  const self = promesa.impl.promise;
+  const root = goog.global;
+
+  const PENDING = Symbol("state/pending");
+  const RESOLVED = Symbol("state/resolved");
+  const REJECTED = Symbol("state/rejected");
+
+  const QUEUE = Symbol("queue");
+  const STATE = Symbol("state");
+  const VALUE = Symbol("value");
+
+  const RESOLVE_TYPE_FLATTEN = Symbol("resolve-type/flatten");
+  const RESOLVE_TYPE_BIND = Symbol("resolve-type/bind");
+  const RESOLVE_TYPE_MAP = Symbol("resolve-type/map");
+
+  const defaultResolveMapHandler = (v) => v;
+  const defaultResolveBindHandler = (v) => self.resolved(v);
+  const defaultResolveFlattenHandler = (v) => self.coerce(v);
+
+  const defaultRejectHandler = (c) => {
+    throw c;
+  };
+
+  class CancellationError extends Error {}
+
+  class PromiseImpl {
+    constructor (val) {
+      this[QUEUE] = [];
+      this[STATE] = PENDING;
+      this[VALUE] = undefined;
+
+      if (val !== undefined) {
+        transition(this, RESOLVED, val);
+      }
+    }
+
+    get state () {
+      return this[STATE];
+    }
+
+    get value () {
+      return this[VALUE];
+    }
+
+    then (resolve, reject) {
+      const deferred = new PromiseImpl();
+
+      this[QUEUE].push({
+        type: RESOLVE_TYPE_FLATTEN,
+        resolve: resolve ?? defaultResolveMapHandler,
+        reject: reject ?? defaultRejectHandler,
+        complete: completeDeferredFn(deferred),
+        // metadata: {
+        //   origin: goog.getUid(this),
+        //   dest: goog.getUid(deferred)
+        // }
+      });
+
+      // console.log("then",
+      //             "uid:", goog.getUid(this),
+      //             "return-uid:", goog.getUid(deferred),
+      //             "state:", this[STATE],
+      //             "value:", fmtValue(this[VALUE]));
+
+      process(this);
+      return deferred;
+    }
+
+    catch (reject) {
+      return this.then(null, reject);
+    }
+
+    finally (f) {
+      this[QUEUE].push({
+        type: RESOLVE_TYPE_FLATTEN,
+        resolve: (value) => f(),
+        reject: (cause) => f(),
+        complete: (value, cause) => null,
+        // metadata: {
+        //   origin: goog.getUid(this),
+        //   dest: goog.getUid(this)
+        // }
+      });
+
+      return this;
+    }
+
+    fmap (resolve, reject) {
+      const deferred = new PromiseImpl();
+
+      this[QUEUE].push({
+        type: RESOLVE_TYPE_MAP,
+        resolve: resolve ?? defaultResolveMapHandler,
+        reject: reject ?? defaultRejectHandler,
+        complete: completeDeferredFn(deferred),
+        // metadata: {
+        //   origin: goog.getUid(this),
+        //   dest: goog.getUid(deferred)
+        // }
+      });
+
+      // console.log("fmap",
+      //             "uid:", goog.getUid(this),
+      //             "return-uid:", goog.getUid(deferred),
+      //             "state:", this[STATE],
+      //             "value:", fmtValue(this[VALUE]));
+
+      process(this);
+      return deferred;
+    }
+
+    fbind (resolve, reject) {
+      const deferred = new PromiseImpl();
+
+      this[QUEUE].push({
+        type: RESOLVE_TYPE_BIND,
+        resolve: resolve ?? defaultResolveBindHandler,
+        reject: reject ?? defaultRejectHandler,
+        complete: completeDeferredFn(deferred),
+        // metadata: {
+        //   origin: goog.getUid(this),
+        //   dest: goog.getUid(deferred)
+        // }
+      });
+
+      // console.log("fbind",
+      //             "uid:", goog.getUid(this),
+      //             "return-uid:", goog.getUid(deferred),
+      //             "state:", this[STATE],
+      //             "value:", fmtValue(this[VALUE]));
+
+      process(this);
+      return deferred;
+    }
+
+    handle (fn, resolveType) {
+      resolveType = resolveType ?? RESOLVE_TYPE_MAP;
+
+      this[QUEUE].push({
+        type: resolveType,
+        resolve: defaultResolveMapHandler,
+        reject: defaultResolveMapHandler,
+        complete: fn,
+        // metadata: {
+        //   origin: goog.getUid(this),
+        //   dest: goog.getUid(this)
+        // }
+      });
+
+      process(this);
+    }
+
+    // Deferred Methods
+
+    resolve(value) {
+      if (this[STATE] === PENDING) {
+        // console.log(":: [deferred:resolve]",
+        //             "uid:", goog.getUid(this),
+        //             "value:", fmtValue(value));
+
+        transition(this, RESOLVED, value);
+      }
+      return null;
+    }
+
+    reject(cause) {
+      if (this[STATE] === PENDING) {
+        // console.log(":: [deferred:reject]",
+        //             "uid:", goog.getUid(this),
+        //             "value:", fmtValue(cause));
+        transition(this, REJECTED, cause);
+      }
+      return null;
+    }
+
+    isPending() {
+      const state = this[STATE];
+      return state === PENDING;
+    }
+
+    isResolved() {
+      const state = this[STATE];
+      return state === RESOLVED;
+    }
+
+    isRejected() {
+      const state = this[STATE];
+      return state === REJECTED;
+    }
+
+    isCancelled() {
+      const state = this[STATE];
+      const value = this[VALUE];
+      return (state === REJECTED && isCancellationError(value));
+    }
+
+    cancel() {
+      this.reject(new CancellationError("promise cancelled"));
+    }
+  }
+
+  const nextTick = (() => {
+    if (typeof root.Promise === "function") {
+      const resolved = Promise.resolve(null);
+      return function queueMicrotaskWithPromise(f, p) {
+        resolved.then(() => f(p));
+      };
+    } else if (typeof root.setImmediate === "function") {
+      return root.setImmediate;
+    } else if (typeof root.setTimeout === "function") {
+      return (f, p) => root.setTimeout(f, 0, p);
+    } else {
+      // console.error("No nextTick. How we gonna do this?");
+      return (f, p) => f.call(this, p);
+    }
+  })();
+
+  function isCancellationError(v) {
+    return v instanceof CancellationError;
+  }
+
+  function fmtValue (o) {
+    if (isThenable(o)) {
+      return `<PROMISE:${goog.getUid(o)}>`;
+    } else if (o instanceof Error) {
+      return `<EXCEPTION:'${o.message}'>`;
+    } else if (o === null || o === undefined) {
+      return `${o}`;
+    } else if (typeof o === "function") {
+      return `<FN:${goog.getUid(o)}>`;
+    } else {
+      return `${o.toString()}`;
+    }
+  }
+
+  function isFunction (o) {
+    return typeof o === "function";
+  }
+
+  function isThenable (o) {
+    if (goog.isObject(o)) {
+      const thenFn = o.then;
+      return isFunction(thenFn);
+    } else {
+      return false;
+    }
+  }
+
+  function constantly(v) {
+    return () => v;
+  }
+
+  function identity (v) {
+    return v;
+  }
+
+  function isPromiseImpl (v) {
+    return v instanceof PromiseImpl;
+  }
+
+  function completeDeferredFn(deferred) {
+    return (value, cause) => {
+      if (cause) {
+        deferred.reject(cause);
+      } else {
+        deferred.resolve(value);
+      }
+    };
+  }
+
+  function process(p) {
+    if (p[STATE] === PENDING) return;
+    nextTick(processNextTick, p);
+    return p;
+  }
+
+  function processNextTick(p) {
+    if (p[QUEUE].length === 0) return;
+
+    const value = p[VALUE];
+    let state = p[STATE];
+    let task, rvalue;
+
+    // console.log(":: process:",
+    //             "uid:", goog.getUid(p),
+    //             "queue:", p[QUEUE].length,
+    //             "state:", p[STATE],
+    //             "value:", fmtValue(p[VALUE]));
+
+    while (p[QUEUE].length) {
+      task = p[QUEUE].shift();
+      // express-cljs patch: a settled promise never changes state, but the
+      // upstream loop let a throwing handler flip the LOCAL `state` to
+      // REJECTED for every later task of the same drain (promesa 12.0.1);
+      // with the shared NULL_PROMISE that silently skipped unrelated
+      // p/do / p/let bodies and resolved them with nil. Re-read it per task.
+      state = p[STATE];
+      try {
+        if (state === RESOLVED) {
+          rvalue = task.resolve(value)
+        } else if (state === REJECTED) {
+          rvalue = task.reject(value)
+        } else {
+          rvalue = new TypeError("invalid state");
+          state = REJECTED;
+        }
+      } catch (e) {
+        state = REJECTED;
+        if (task.type === RESOLVE_TYPE_BIND) {
+          // This is a special case, for handle when an exception is
+          // raised inside a handler instead of returning a resovled
+          // or rejected promise instance
+          rvalue = self.rejected(e);
+        } else {
+          rvalue = e;
+        }
+      }
+
+      // console.log(":: process-task:",
+      //             task.metadata,
+      //             "rvalue:", fmtValue(rvalue),
+      //             "type:", task.type);
+
+      resolveTask(task, state, rvalue);
+    }
+  }
+
+  function resolveTask(task, state, value) {
+    if (task.complete === undefined) return;
+
+    if (task.type === RESOLVE_TYPE_MAP) {
+      if (state === REJECTED) {
+        task.complete(null, value);
+      } else {
+        task.complete(value, null);
+      }
+    } else if (task.type === RESOLVE_TYPE_FLATTEN) {
+      if (isPromiseImpl(value)) {
+        value.handle((v, c) => {
+          if (c) {
+            resolveTask(task, REJECTED, c);
+          } else {
+            resolveTask(task, RESOLVED, v);
+          }
+        });
+      } else if (isThenable(value)) {
+        value.then((v) => {
+          resolveTask(task, RESOLVED, v);
+        }, (c) => {
+          resolveTask(task, REJECTED, c);
+        });
+      } else {
+        if (state === REJECTED) {
+          task.complete(null, value);
+        } else {
+          task.complete(value, null);
+        }
+      }
+    } else if (task.type === RESOLVE_TYPE_BIND) {
+      if (isPromiseImpl(value)) {
+        value.handle((v, c) => {
+          task.complete(v, c);
+        });
+      } else if (isThenable(value)) {
+        value.then((v) => {
+          task.complete(v, null);
+        }, (c) => {
+          task.complete(null, c);
+        });
+      } else {
+        task.complete(null, new TypeError("expected thenable"));
+      }
+    } else {
+      task.complete(null, new TypeError("internal: invalid resolve type"));
+    }
+  }
+
+  function transition(p, state, value) {
+    // console.log(">> transition",
+    //             "uid:", goog.getUid(p),
+    //             "from-state:", p[STATE],
+    //             "to-state:", state,
+    //             "value:", fmtValue(value),
+    //             "queue:", p[QUEUE].length);
+
+    if (p[STATE] === state ||
+        p[STATE] !== PENDING) {
+      return;
+    }
+
+    p[STATE] = state;
+    p[VALUE] = value;
+
+    return processNextTick(p);
+  }
+
+  self.PromiseImpl = PromiseImpl;
+  self.CancellationError = CancellationError;
+  self.isCancellationError = isCancellationError;
+
+  self.deferred = () => {
+    return new PromiseImpl();
+  };
+
+  const NULL_PROMISE = new PromiseImpl(null);
+
+  self.resolved = function resolved (value) {
+    if (value === null) {
+      return NULL_PROMISE;
+    } else {
+      const p = new PromiseImpl();
+      p[STATE] = RESOLVED;
+      p[VALUE] = value;
+      // console.log("++ [resolved]", "uid:", goog.getUid(p), "value:", value);
+
+      return p;
+    }
+  };
+
+  self.rejected = function rejected (reason) {
+    const p = new PromiseImpl();
+    p[STATE] = REJECTED;
+    p[VALUE] = reason;
+
+    // console.log("++ [rejected]", "uid:", goog.getUid(p), "value:", fmtValue(reason));
+
+    return p;
+  };
+
+  self.all = function all (promises) {
+    return promises.reduce((acc, p) => {
+      return acc.then((results) => {
+        return self.coerce(p).fmap((v) => {
+          results.push(v);
+          return results;
+        });
+      });
+    }, self.resolved([]));
+  };
+
+  self.create = function coerce (promise) {
+    if (promise instanceof PromiseImpl) {
+      return promise;
+    } else if (isThenable(promise)) {
+      const deferred = self.deferred();
+      promise.then((v) => {
+        deferred.resolve(v);
+      }, (c) => {
+        deferred.reject(c);
+      });
+      return deferred;
+    } else if (promise instanceof Error) {
+      return self.rejected(promise);
+    } else {
+      return self.resolved(promise);
+    }
+  };
+
+  self.coerce = function coerce (promise) {
+    if (promise instanceof PromiseImpl) {
+      return promise;
+    } else if (isThenable(promise)) {
+      const deferred = self.deferred();
+      promise.then((v) => {
+        deferred.resolve(v);
+      }, (c) => {
+        deferred.reject(c);
+      });
+      return deferred;
+    } else {
+      return self.resolved(promise);
+    }
+  };
+
+  self.race = function race (promises) {
+    const deferred = self.deferred();
+
+    promises.forEach((p) => {
+      self.coerce(p).handle((v, c) => {
+        if (c) {
+          deferred.reject(c);
+        } else {
+          deferred.resolve(v);
+        }
+      });
+    });
+
+    return deferred;
+  };
+
+  self.nextTick = nextTick;
+  self.isThenable = isThenable;
+
+  self.PENDING = PENDING;
+  self.RESOLVED = RESOLVED;
+  self.REJECTED = REJECTED;
+});
