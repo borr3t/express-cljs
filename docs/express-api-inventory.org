@@ -1,0 +1,1089 @@
+#+TITLE: Express 5 + ws API inventory — express-cljs phase 1
+#+DATE: 2026-09-25
+#+STARTUP: overview
+#+OPTIONS: toc:3
+
+* About this document
+This is the verified inventory of the JavaScript surface that express-cljs wraps: Express
+5 (HTTP application, router, request, response, built-in middleware, server lifecycle) and
+the =ws= package (WebSocket server on the same HTTP server), plus the design space of the
+RPC layer that mounts one method registry over both transports. It is research only;
+implementation happens in later phases (section 12 is the Phase 2/3/4 outline).
+
+*Product constraint that shapes everything below:* the finished library is
+ClojureScript-only at every call site: no =^js= hints, no JS interop outside ONE binding
+namespace (=express-cljs.core=), kebab-case keyword maps in and out, promesa promises for
+every async operation, core.async channels for websocket messages and lifecycle events,
+and zero runtime npm dependencies beyond =express= and =ws=. Handlers are functions of a
+request *map* returning a response *map* (or a promise of one); =req= / =res= / socket
+objects never reach user code. Every upstream fact below is therefore paired with the
+consequence for that design (sections 11 and 12).
+
+** Method and evidence tags
+Every fact carries one or more evidence tags:
+- =[NPM]= — =npm view= registry metadata fetched 2026-09-25 (versions, dist-tags, publish
+  times, dependencies, peer ranges).
+- =[README x]= — the README of package =x= as installed by =npm install= in this repo
+  (express 5.2.1, ws 8.21.3, router 2.2.0, path-to-regexp 8.4.2, body-parser 2.3.0,
+  serve-static 2.2.1, send 1.2.1, finalhandler 2.1.1, http-errors 2.0.1, qs 6.16.0,
+  cookie 0.7.2, proxy-addr 2.0.7) or, for express-ws 5.0.2, in the throw-away census
+  install under the job tmp dir (never in this repo's =package.json=).
+- =[DTS x]= — the installed TypeScript declarations: =@types/express@5.0.6=,
+  =@types/express-serve-static-core@5.1.3=, =@types/serve-static=, =@types/body-parser=,
+  =@types/ws@8.18.1=. Member names and option shapes come from here.
+- =[SRC x]= — read from the installed package sources (=express/lib/*.js=,
+  =ws/lib/*.js=, =finalhandler/index.js=, =express-ws/lib/*.js=). Defaults and edge
+  behaviour come from here when the README is silent.
+- =[DOC url]= — the official documentation pages: the Express 5 migration guide and the
+  5.x Application reference (rendered pages fetched 2026-09-25; the markdown sources
+  are not published), the =ws= GitHub =doc/ws.md= and README (default branch,
+  2026-09-25, consistent with the installed 8.21.3 sources), the Node.js v22.x
+  =doc/api/http.md= / =net.md=, the JSON-RPC 2.0 specification.
+- =[LIVE]= — observed in this session on 2026-09-25 with three throw-away Node scripts
+  (=probe-express.js=, =probe-express2.js=, =probe-ws.js=, =probe-close.js= in the job tmp
+  dir, not part of the repo) on Node v22.23.2, Linux x86-64, against the packages
+  =npm install= put in =node_modules=: express 5.2.1 on a loopback ephemeral port
+  exercised with Node's global =fetch=, ws 8.21.3 server and client in the same process.
+  Nothing touched the network except =npm install= and the documentation fetches.
+- =[GH]= — GitHub repository metadata via the public API (2026-09-25): last commit,
+  last push, open issue count, latest release.
+Anything not covered by these tags is in section 10 "Uncertain / needs verification".
+
+** Reading conventions
+- Upstream names are given verbatim (camelCase JS options such as =maxPayload=,
+  space-separated Express settings such ='trust proxy'=, lower-case wire header names);
+  the kebab-case translation lives in section 11.1.
+- "Scope" column values: =core= (Phase 2, =express-cljs.core= / =route= / =middleware=),
+  =ws= (Phase 3), =rpc= (Phase 4), =none= (inventoried, deliberately not exposed),
+  =mount= (not wrapped, but a caller-supplied upstream middleware can be mounted),
+  =later= (possible follow-up).
+- "req map" / "response map" refer to the ClojureScript shapes of section 11.3 / 11.4.
+- Sizes are bytes unless a =bytes=-library string such as ="100kb"= is quoted; times are
+  milliseconds; close codes are the RFC 6455 numeric codes.
+
+* 0. Coverage checklist
+| #  | Area                                                                 | Status   | Section |
+|----+----------------------------------------------------------------------+----------+---------|
+| 1  | Version decision: express 5.x vs 4.x, breaking changes, router lineage | complete | 1       |
+| 2  | WebSocket integration decision: express-ws vs plain ws               | complete | 2       |
+| 3  | Routing census (paths, params, wildcards, routers, mounting, order)  | complete | 3       |
+| 4  | Middleware census (built-ins, out-of-scope third parties, errors)    | complete | 4       |
+| 5  | req / res surface census + server lifecycle and close choreography   | complete | 5       |
+| 6  | ws surface census                                                    | complete | 6       |
+| 7  | RPC layer design space + proposed syntax                             | complete | 7       |
+| 8  | Error taxonomy                                                       | complete | 8       |
+| 9  | Pitfalls checklist (numbered)                                        | complete | 9       |
+| 10 | Uncertain / needs verification (numbered, with house positions)      | complete | 10      |
+| 11 | Implementation notes (translation, req/response map shapes, channels)| complete | 11      |
+| 12 | Phase 2/3/4 implementation outline (namespaces + public fns)         | complete | 12      |
+| 13 | Sources                                                              | complete | 13      |
+
+* 1. Version decision: express 5.x vs 4.x
+** 1.1 Registry facts [NPM]
+| Fact | Value |
+|------+-------|
+| =express= dist-tags | =latest= → *5.2.1* (2025-12-01); =latest-4= → 4.22.3 |
+| =express@5.2.1= engines | =node >= 18= |
+| installed by =npm install express@latest= | express 5.2.1, router 2.2.0, path-to-regexp 8.4.2, body-parser 2.3.0, serve-static 2.2.1, send 1.2.1, finalhandler 2.1.1, qs 6.16.0, http-errors 2.0.1, cookie 0.7.2, content-type 1.0.5, type-is 2.1.0, accepts 2.0.0, etag 1.8.1, fresh 2.0.0, vary 1.1.2 |
+| express 5 runtime dependencies (27) | accepts, body-parser, content-disposition, content-type, cookie, cookie-signature, debug, depd, encodeurl, escape-html, etag, finalhandler, fresh, http-errors, merge-descriptors, mime-types, on-finished, once, parseurl, proxy-addr, qs, range-parser, router, send, serve-static, statuses, type-is, vary |
+| package =files= | =index.js=, =lib/= (application.js, express.js, request.js, response.js, utils.js, view.js) — no =History.md= is shipped; the changelog was read from GitHub =master= |
+| =npm audit= on this repo | 6 *low* advisories, all in the shadow-cljs toolchain (=node-libs-browser= → =crypto-browserify= → =elliptic=); express and ws are clean; the fix npm proposes is =shadow-cljs@3.5.3= (a semver-major toolchain change, not taken in Phase 0) |
+
+** 1.2 Breaking changes that matter for a wrapper [DOC migrating-5][SRC express History.md][LIVE]
+| Change in 5.x | Consequence for express-cljs |
+|---------------+------------------------------|
+| Route path syntax is path-to-regexp 8: wildcards must be named (=/*splat=), optional segments use braces (=/users{/:id}=, =/:file{.:ext}=), regexp characters inside strings are unsupported and =()[]?+!= are reserved (escape with =\\=), parameter names may be quoted (=:"my-name"=) | Routing-as-data (section 3.1) validates and documents the 8.x syntax; the wrapper never rewrites 4.x syntax; a 4.x-style path throws at registration (LIVE: =Unexpected ( at index 4: /bad(x)?; visit https://git.new/pathToRegexpError for info=) |
+| Wildcard params are *arrays* (=splat: ["a" "b" "c"]=); unmatched optional params are *omitted* (no =undefined=); =req.params= has a null prototype for string paths | =:params= is a kebab-keyed map of strings or vectors; absent keys are absent |
+| Rejected promises (and throws inside async handlers) are forwarded to the error chain as =next(err)=; a falsy rejection becomes =Error('Rejected promise')= | The wrapper's handler adapter still catches everything itself (LIVE section 1.4) so that *non-Error* rejections and promesa rejections are normalised into the util taxonomy before Express sees them |
+| =req.query= is a getter (not writable); default ='query parser'= is ='simple'= (Node =querystring=), ='extended'= (qs) is opt-in | =:query= is a fresh CLJS map; repeated keys become vectors; bracket keys stay literal unless the app is built with =:query-parser :extended= |
+| =req.body= is =undefined= until a body parser ran (4.x: ={}=) | =:body= is =nil= when nothing parsed |
+| =req.host= keeps the port (4.x stripped it); =req.hostname= strips it | two distinct keys =:host= / =:hostname= |
+| =res.status()= only accepts integers 100..999, throws =TypeError= / =RangeError= otherwise | =util/valid-status?= gate before any upstream call (Phase 0 done) |
+| =res.redirect('back')= / =res.location('back')= removed; =res.redirect(url, status)= / =res.send(body, status)= / =res.json(obj, status)= / =res.jsonp(obj, status)= / =res.send(status)= / =res.sendfile()= / =req.param()= / =app.del()= / =app.param(fn)= / =router.param(fn)= / pluralised =req.acceptsCharset= etc. / =express.static.mime= removed | none of these are wrapped; the response map has explicit =:status= and =:redirect= keys |
+| =res.clearCookie= ignores caller =maxAge= / =expires= | =:clear-cookies= entries take only path/domain/etc. |
+| =res.vary()= without a field throws | argument validation |
+| =express.urlencoded= defaults =extended: false=; =express.static= / =res.sendFile= default =dotfiles: 'ignore'= (hidden *directories* in the request path are ignored too, e.g. =/.well-known/…= returns 404 unless =dotfiles: 'allow'=); =hidden= / =from= options removed | defaults documented as-is; =:dotfiles :allow= is the escape hatch |
+| =app.listen(port, cb)= passes listen errors (=EADDRINUSE=) to the callback instead of throwing | the wrapper does not use =app.listen= at all: it creates the =http.Server= itself (needed for the =upgrade= event, section 2.3) and promisifies =listen= / =error= |
+| =app.router= is back as a reference to the base router; router debug namespace is =router= / =router:*= | not exposed |
+| MIME types come from a newer =mime-db= (=.js= → =text/javascript=) | affects =static= / =send-file= only |
+| Body parsers inflate gzip, deflate *and* Brotli | documented |
+| =router.param(name, fn)= no longer accepts an array of names (=app.param= still does) | the wrapper registers one param handler per name |
+| 5.2.1 reverted 5.2.0's extended-query-parser change (CVE-2024-51999 was rejected) | nothing to do; keep the 'simple' default |
+| Node ≥ 18 required; express 5.1.0 dropped =setprototypeof=, =safe-buffer=, =utils-merge=, =methods=, =depd= | fine on Node 22 |
+
+** 1.3 Router lineage [README router][README path-to-regexp][SRC express/lib/express.js]
+- Express 5 no longer contains its own router: =express.Router= *is* the =router@2.2.0=
+  package (=exports.Router = Router=, =exports.Route = Router.Route=), which wraps
+  =path-to-regexp@8=. =router= "can be used with a plain =http.createServer=" and adds
+  only =next('router')= / =next('route')= semantics on top.
+- =router(options)=: =strict= (default =false=: trailing slashes optional),
+  =caseSensitive= (default =false=), =mergeParams= (default =false=). [DTS RouterOptions]
+  lists the same three keys.
+- Handlers "can optionally return a Promise… if the promise is rejected, =next= will be
+  called with the rejected value, or an error if the value is falsy" — this is the whole
+  async contract; a *resolved* promise is ignored (the handler must still respond).
+- Error-handling middleware = arity-4 functions =(err, req, res, next)=; "as long as the
+  error is in the pipeline, normal middleware and handlers will be bypassed".
+- =router.param(name, fn)= positions the middleware "in the same stack as =.use=" and also
+  honours a returned promise (LIVE: an async param handler that throws → 500 through the
+  error chain).
+- =express= 5 exports exactly: =Route Router application json raw request response static
+  text urlencoded= [LIVE =Object.keys(express)=]. There is no =express.query= (4.x had it)
+  and no =express.Router().ws= (=typeof= is ="undefined"= until express-ws monkeypatches it).
+
+** 1.4 Async handler semantics — what 5.2.1 actually does [LIVE]
+| Handler behaviour | Observed response (=NODE_ENV= unset, no error middleware) |
+|-------------------+----------------------------------------------------------|
+| =async= handler throws =Error('boom-async')= | 500, HTML body with the *stack trace*, =console.error= of the stack |
+| synchronous throw | identical to the rejection path (500 + stack) |
+| rejects with a *string* =throw 'string-reason'= | 500, body =<pre>string-reason</pre>= (the string is used as the message) |
+| rejects with =undefined= | 500, =Error: Rejected promise= synthesised by =router/lib/layer.js:161= |
+| rejects with =err.status = 418= and =err.headers = {'x-tea': 'yes'}= | *418*, header =x-tea: yes= sent, stack body |
+| rejects with =err.status = 500, err.expose = false= | 500, stack body — =expose= is *not* consulted by finalhandler (section 8.1) |
+| =next(new Error('via-next'))= | same as a rejection |
+| error thrown inside an arity-4 error middleware | forwarded to the next error handler / finalhandler (500 =second-from-error-mw=) |
+| =NODE_ENV=production= | body is only the reason phrase (=Internal Server Error=, =Unprocessable Entity=, =Too Many Requests=, =Bad Request=), never the message, even for exposed 4xx errors |
+Conclusion: Express 5 gives the wrapper a reliable "rejection → error chain" guarantee,
+but its *default renderer* is HTML-only and message-less in production, so the wrapper
+installs its own final error middleware (section 8.5) and content-negotiates JSON.
+
+** 1.5 Recommendation
+*Express 5.2.1.* Evidence: it is =latest= on npm; it is the only line receiving features
+(5.1.0 =Uint8Array= bodies, =ETag= option on =sendFile=; unreleased master already carries
+the body-parser 2.3.0 fail-open fix CVE-2026-12590, which our install has); it needs Node
+≥ 18 which we exceed (22.23.2); the native promise forwarding removes an entire class of
+"forgot =.catch(next)=" bugs that a promesa-based wrapper would otherwise have to re-create;
+the router is a standalone package with a documented semantics; the path-to-regexp 8
+syntax is stricter (throws on ambiguity, no ReDoS-prone regex-in-string) which suits a
+routing-as-data design. 4.22.3 is maintenance-only and its =0.1.x= path-to-regexp accepts
+regexes in strings that we would have to police ourselves. Nothing the RPC or WebSocket
+layers need exists only in 4.x.
+
+* 2. WebSocket integration decision
+** 2.1 Candidates census
+| Package | Version | Evidence | Facts |
+|---------+---------+----------+-------|
+| =ws= | 8.21.3 | [NPM][GH][README ws] | =latest=, released 2026-08-06; repo pushed 2026-09-04; 5 open issues; 22.8k stars; =engines node >= 10=; zero runtime deps; optional peer deps =bufferutil= and =utf-8-validate= (native speed-ups, opt-in, =WS_NO_BUFFER_UTIL= / =WS_NO_UTF_8_VALIDATE= env to disable); exports CJS =index.js=, ESM =wrapper.mjs=, browser stub |
+| =express-ws= | 5.0.2 | [NPM][GH][README express-ws][SRC express-ws] | last publish 2022-06-17; last commit 2021-06-07; a push on 2024-07-28 with no release; 82 open issues; depends on =ws ^7.4.6= (installs ws *7.5.13*, two majors behind); peer =express ^4.0.0 \vert\vert ^5.0.0-alpha.1= (declared compatible with the *alpha*; no evidence of testing against 5.x GA); =engines node >= 4.5=; Babel-compiled ES5 |
+
+** 2.2 How express-ws works and why it is brittle [SRC express-ws/lib/index.js, add-ws-method.js, websocket-url.js, wrap-middleware.js]
+1. =expressWs(app, server?, {leaveRouterUntouched, wsOptions})= creates =http.createServer(app)=
+   when no server is passed and *replaces =app.listen=* with =server.listen=.
+2. It monkeypatches =app.ws= and — unless =leaveRouterUntouched= — the *global*
+   =express.Router= prototype with a =.ws(path, ...handlers)= method.
+3. =.ws(path, h)= registers a fake *GET* route at =path + '/.websocket'= (query preserved)
+   whose middleware unwraps =req.ws= and calls =h(ws, req, next)=; non-websocket requests
+   to that fake route call =next()=.
+4. It creates =new ws.Server({server})= (ws 7) so *every* =upgrade= on the HTTP server is
+   accepted by it; on ='connection'= it rewrites =request.url= to the =/.websocket= form,
+   builds a dummy =http.ServerResponse= whose =writeHead(status > 200)= closes the socket,
+   and runs =app.handle(request, dummyResponse, cb)=; if no =.ws= route marked the request
+   handled, the socket is closed.
+Consequences: (a) it owns the upgrade event, so no second =WebSocketServer= (or our own
+upgrade auth) can coexist; (b) it depends on Express internals (=app.handle=, the Router
+factory-is-prototype hack the source itself calls "Here be dragons"); (c) ws 7 lacks 8.x
+fixes and API (=allowSynchronousEvents=, =autoPong=, =wsClientError=, =closeTimeout=,
+=maxBufferedChunks=, =maxFragments=); (d) the handshake is already *complete* when Express
+middleware runs, so an auth failure can only =socket.close()= after a 101, never answer
+401/403; (e) it is unmaintained since 2021 in practice.
+
+** 2.3 Plain ws on the HTTP server (=noServer= + =upgrade=) [DOC ws README "Multiple servers sharing a single HTTP/S server", "Client authentication"][DOC node http 'upgrade'][LIVE]
+- Create =new WebSocketServer({noServer: true, ...})= and listen to the HTTP server's
+  ='upgrade'= event yourself; route on =request.url= pathname; for accepted paths call
+  =wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req))=; for the
+  rest write a raw HTTP response (=HTTP/1.1 404 Not Found\r\n\r\n=) and =socket.destroy()=.
+- Node: "By default all HTTP upgrade requests are ignored … unless you listen to this
+  event, in which case they are all accepted" — so the wrapper must always answer
+  non-matching upgrades itself. Node 22.21+ adds a =shouldUpgradeCallback= server option
+  for finer control (not needed).
+- Authentication happens *before* =handleUpgrade= with the full HTTP request (headers,
+  cookies, query) and can answer 401/403 as a proper HTTP response; the ws docs explicitly
+  discourage =verifyClient= in favour of this.
+- LIVE: an upgrade to a non-websocket path answered with a hand-written 404 produced a
+  client-side ='unexpected-response'= event with =statusCode 404=; the accepted path
+  delivered the upgrade request (=url=, =sec-websocket-protocol=, =cookie=, custom =x-auth=
+  header, =socket.remoteAddress=) to the ='connection'= listener.
+- The same HTTP server keeps serving Express for normal requests; no monkeypatching.
+
+** 2.4 Recommendation
+*Plain =ws= 8.21.3 in =noServer= mode on the wrapper-created =http.Server=; express-ws is
+rejected.* Evidence: 2.1 (maintenance and the ws 7 pin), 2.2 (mechanics), 2.3 (the official
+pattern gives everything express-ws gives — path routing, access to the upgrade request,
+sharing one server — plus pre-handshake auth and Node-native close choreography, section
+5.7). "Both" is not needed: the wrapper's =ws/serve!= takes a path (or a predicate) and
+the rest of the upgrade traffic is answered 404. The dev dependency set is therefore
+=express= + =ws= (+ =@types/*= for the census only; they are not required at runtime).
+* 3. Routing census
+** 3.1 Path syntax (path-to-regexp 8.4.2 as used by router 2.2.0) [README path-to-regexp][DOC migrating-5][LIVE]
+| Pattern | Request | Result (LIVE) | Notes |
+|---------+---------+---------------+-------|
+| =/users/:id= | =/users/42= | 200 ={"id":"42"}= | params are decoded strings |
+| =/users/:id= | =/users/42/= | 200 ={"id":"42"}= | trailing slash optional (=strict= false) |
+| =/users/:id= | =/users/42/extra= | 404 | params stop at the segment delimiter |
+| =/users/:id= | =/USERS/42= | 200 | case-insensitive by default |
+| =/files/*splat= | =/files/a/b/c= | ={"splat":["a","b","c"]}= | wildcard → *vector of segments* |
+| =/files/*splat= | =/files= and =/files/= | 404 | a wildcard needs ≥ 1 segment; use =/files{/*splat}= to also match the bare path (docs: =/{*splat}= for root) |
+| =/opt{/:id}= | =/opt= / =/opt/7= | ={}= / ={"id":"7"}= | optional group; unmatched key *omitted* |
+| =/ext/:file{.:ext}= | =/ext/report.pdf= / =/ext/report= | ={"file":"report","ext":"pdf"}= / ={"file":"report"}= | the 5.x spelling of 4.x =:file.:ext?= |
+| =/quoted/:"my-name"= | =/quoted/zz= | ={"my-name":"zz"}= | quoted names allow non-identifier characters |
+| =/^\/re\/(\d+)$/= (RegExp) | =/re/123= / =/re/abc= | ={"0":"123"}= / 404 | RegExp paths still work; groups are *indexed* params; =req.params= keeps a normal prototype |
+| =["/arr1" "/arr2"]= | =/arr2= | 200 | arrays of paths (strings and/or RegExps) |
+| =/bad(x)?= | — | throws at registration: =Unexpected ( at index 4= | reserved =()[]?+!= |
+| =/bad/*= | — | throws: =Missing parameter name at index 6= | unnamed wildcard |
+| =/bad/:id?= | — | throws: =Unexpected ? at index 8= | 4.x optional modifier |
+House position (section 11.2): =route= accepts a path as a *string in 8.x syntax*, a
+*RegExp*, or a *vector* of those, passes it through untouched, and re-throws registration
+errors as =:express-cljs/argument-error= carrying the upstream message (which links to
+=https://git.new/pathToRegexpError=). A tiny CLJS lint (=route/check-path=) rejects the
+three 4.x spellings above with a clearer message before upstream sees them.
+
+** 3.2 Registration surface [DTS IRouter, Application][README router][SRC express/lib/application.js]
+| Upstream | Signature | Scope | Notes |
+|----------+-----------+-------+-------|
+| =app.METHOD(path, ...handlers)= / =router.METHOD= | one per lower-cased Node method (35 on Node 22: acl bind checkout connect copy delete get head link lock m-search merge mkactivity mkcalendar mkcol move notify options patch post propfind proppatch purge put query rebind report search source subscribe trace unbind unlink unlock unsubscribe) | core | =express/lib/utils.js= derives the list from =http.METHODS=; =app.get(name)= with *one string argument* is the settings getter, not a route (=[DTS] get: ((name) => any) & IRouterMatcher=) |
+| =app.all(path, ...handlers)= | registers every method | core | LIVE =POST /all= → =all:POST= |
+| =app.use([path], ...fns)= | mounts middleware, a =Router=, or a sub-=app= at =path= (default =/=); strips =path= from =req.url= (=req.baseUrl= holds it) | core | LIVE: mounted router saw =url "/"=, =baseUrl "/mount/M1"=, =originalUrl "/mount/M1"= |
+| =app.route(path)= | returns a =Route= with chainable =.get/.post/.all= for one path | core | LIVE =route('/routed').get(..).post(..).all(405)= → GET 200, DELETE 405, OPTIONS 405 |
+| =app.param(name \vert [names], fn(req,res,next,value,name))= | pre-loads a param; promise-aware | core | LIVE sync param sets data seen by the route; async rejection → error chain |
+| =express.Router({caseSensitive, mergeParams, strict})= | sub-router | core | =mergeParams= LIVE: parent =:mid= visible in child (=true=) vs ={}= (=false=) |
+| sub-app =app.use('/sub', otherApp)= | mounts an app; emits ='mount'= on the child with the parent; child =mountpath= = "/sub"; settings/prototypes inherited | later | LIVE verified; not needed for v1 (one app + routers) |
+| =app.set/get/enable/disable/enabled/disabled(setting)= | settings (3.9) | core | |
+| =app.engine=, =app.render=, =res.render=, views | template engines | none | API-server library; =:render= is out of scope (uncertainty 10.12) |
+| =app.listen(...)= | creates =http.Server= and listens; 5.x passes errors to the callback | none | the wrapper creates the server itself (5.7) |
+| =app.path()=, =app.mountpath=, =app.locals=, =app.router=, =app.on('mount')= | introspection | later | =app.locals= exposed read-only on the req map as =:app-locals= is *not* planned; user state belongs in closures |
+| =app.handle(req, res, cb)= | private dispatch | none | express-ws needs it; we do not |
+| =Router.Route= | =express.Route= export | none | |
+
+** 3.3 Ordering, precedence and flow control [README router][LIVE]
+- Layers run in *registration order*; the first matching route whose handler responds
+  wins. There is no specificity sort: register =/users/me= before =/users/:id=.
+- =next()= continues to the next matching layer; =next('route')= skips the remaining
+  handlers of the *current route* and continues with the next route (LIVE: =/chain= first
+  route set =x-first: 1= then =next('route')=, second route answered =second-route= and the
+  header survived); =next('router')= exits the current =Router= to its parent.
+- =next(err)= (or a rejection) switches the pipeline to *error middleware only* (arity 4)
+  until one responds; if none does, =finalhandler= renders it (8.1).
+- A handler that neither responds nor calls =next= leaves the request pending forever
+  (router README: "the request will stall if this is not called"). The wrapper's adapter
+  always ends the request: a response map → response; =nil= → =next()= (explicit
+  fall-through, section 11.4); a rejection → =next(err)=.
+- Automatic behaviour without user routes: =HEAD= is served by the =GET= route (LIVE
+  =HEAD /plain= → 200, headers of the GET, empty body); =OPTIONS= on a routed path answers
+  =200= with =Allow: GET, HEAD= and the same text as body (LIVE); unknown path → 404
+  =Cannot GET /nope=; known path wrong method → 404 =Cannot POST /plain= (Express does *not*
+  emit 405 by itself; use =route(path).all= for that, LIVE 3.2).
+- =router.use= layers are not considered for the automatic =OPTIONS= answer (router README).
+
+** 3.4 Mounting and URL fields [LIVE][DTS Request]
+| Field | Top-level route =/mount/M1/deep/X= mounted router at =/mount/:mid= |
+|-------+---------------------------------------------------------------------|
+| =req.originalUrl= | =/mount/M1/deep/X= (never changes) |
+| =req.baseUrl= | =/mount/M1= (the matched mount prefix, params substituted) |
+| =req.url= | =/deep/X= (mount-relative, includes the query string) |
+| =req.path= | =/deep/X= (mount-relative, no query) |
+| =req.params= | ={"mid":"M1","x":"X"}= with =mergeParams=, ={"x":"X"}= without |
+| =req.route.path= | the matched route's path string (only inside a route handler) |
+
+** 3.5 Trailing slash and case [README router][LIVE]
+- Default =strict: false=: =/slash= and =/slash/= both match a route registered as
+  =/slash/= (LIVE both 200). Default =caseSensitive: false=: =/casetest= matches
+  =/CaseTest= (LIVE). Both are per-router options *and* app settings (='strict routing'=,
+  ='case sensitive routing'=, 3.9) which the app's own router reads at construction time.
+- =express.static= redirects a directory request without a trailing slash to the slashed
+  form (=redirect: true= default; LIVE =/static/src= → followed to =/static/src/=).
+
+** 3.6 Query parsing [SRC express/lib/utils.js compileQueryParser][DOC application settings][README qs][LIVE]
+| ='query parser'= value | Parser | LIVE =?a=1&b[c]=2&arr=1&arr=2&x.y=3= |
+|------------------------+--------+------------------------------------|
+| ='simple'= (default) / =true= | Node =querystring.parse= | ={"a":"1","b[c]":"2","arr":["1","2"],"x.y":"3"}= — repeated keys → array, brackets literal |
+| ='extended'= | =qs.parse(str, {allowPrototypes: true})= (note the *express-chosen* =allowPrototypes: true=; qs defaults =depth 5=, =parameterLimit 1000=, =arrayLimit 20=) | nested objects (=b: {c: "2"}=), as the urlencoded =extended= body LIVE shows |
+| =false= | disabled: =req.query= is =Object.create(null)= | ={}= |
+| function | custom =(str) => object= | |
+House position: =:query-parser :simple= default; =:extended= opt-in with a note that
+Express enables =allowPrototypes= (pitfall 9.7).
+
+** 3.7 404 / 405 / method handling levels
+| Level | Who answers | Body |
+|-------+-------------+------|
+| no route matched | =finalhandler= | 404 HTML =Cannot <METHOD> <path>= (both unknown path and known path with the wrong method) |
+| =express.static= miss with =fallthrough: true= (default) | =next()= → same 404 | dotfile denials (=403=) *also* fall through to this 404 (LIVE =dotfiles: 'deny'= → 404) |
+| =express.static= miss with =fallthrough: false= | =next(err)= | 404 with the =ENOENT= stack in development (LIVE) |
+| =route(path).all= | user | e.g. 405 (LIVE) |
+| wrapper (Phase 2) | =core/not-found= final middleware | JSON ={"error":{"status":404,"message":"Not Found"}}= or text by =Accept= (section 8.5) |
+
+** 3.8 Methods and =QUERY= [LIVE http.METHODS][SRC express History.md unreleased]
+Node 22.23.2 exposes 35 methods including the new =QUERY=; Express derives its method
+list from Node, so =app.query= exists on this Node ([DTS] marks =query?= optional). The
+unreleased Express changelog makes =req.fresh= honour =QUERY= as a safe method. House
+position: the wrapper's method keyword set is derived at runtime from the binding
+(=core/methods=), and =route/query= is included when present.
+
+** 3.9 Application settings [DOC application][SRC express/lib/application.js defaultConfiguration, utils.js][LIVE app.settings]
+| Setting (upstream) | Type / values | Default (LIVE) | Wrapper key | Scope |
+|--------------------+---------------+----------------+-------------+-------|
+| ='case sensitive routing'= | boolean | undefined (false) | =:case-sensitive?= | core |
+| ='strict routing'= | boolean | undefined (false) | =:strict?= | core |
+| ='env'= | string | =NODE_ENV= or ="development"= | =:env= | core (drives error rendering) |
+| ='etag'= | =true=/='weak'= (weak), ='strong'=, =false=, function | ="weak"= | =:etag= =:weak \vert :strong \vert false= | core |
+| ='json escape'= | boolean (escape =<>&= as unicode) | undefined | =:json-escape?= | core |
+| ='json replacer'= | function/array for =JSON.stringify= | undefined | =:json-replacer= | core (function passthrough) |
+| ='json spaces'= | number/string | undefined | =:json-spaces= | core |
+| ='jsonp callback name'= | string | ="callback"= | — | none (jsonp not wrapped) |
+| ='query parser'= | =false= / ='simple'= / ='extended'= / fn | ="simple"= | =:query-parser= | core |
+| ='subdomain offset'= | number | 2 | =:subdomain-offset= | core |
+| ='trust proxy'= | boolean / number (hops) / string CSV / array / fn; names =loopback= (127.0.0.1/8, ::1/128), =linklocal= (169.254.0.0/16, fe80::/10), =uniquelocal= (10/8, 172.16/12, 192.168/16, fc00::/7); compiled by =proxy-addr= | =false= | =:trust-proxy= (keyword names allowed: =:loopback=) | core |
+| ='views'=, ='view cache'=, ='view engine'= | templates | =cwd/views=, prod-only true, undefined | — | none |
+| ='x-powered-by'= | boolean | =true= (header =X-Powered-By: Express= sent) | =:x-powered-by?= | core, wrapper default *false* (pitfall 9.14) |
+Setting names are lower-case words separated by spaces (=util/kebab->setting=, Phase 0);
+the two dashed names (=x-powered-by=, =etag=) are special-cased. Sub-apps inherit
+inherit-only-when-undefined settings plus ='trust proxy'= (doc note).
+* 4. Middleware census
+** 4.1 Built-in middleware (=express.json= / =urlencoded= / =text= / =raw= = body-parser 2.3.0; =express.static= = serve-static 2.2.1 over send 1.2.1) [README body-parser][README serve-static][README send][DTS][LIVE]
+*** Body parsers — options and defaults
+| Option (camelCase) | json | urlencoded | text | raw | Default | Wrapper key |
+|--------------------+------+------------+------+-----+---------+-------------|
+| =limit= | ✓ | ✓ | ✓ | ✓ | ="100kb"= (number = bytes, string via =bytes=); since body-parser 2.3.0 an *invalid* =limit= throws at construction instead of silently disabling the limit (CVE-2026-12590) | =:limit= |
+| =inflate= | ✓ | ✓ | ✓ | ✓ | =true= (gzip, deflate, br) | =:inflate?= |
+| =type= | ✓ | ✓ | ✓ | ✓ | =application/json= / =application/x-www-form-urlencoded= / =text/plain= / =application/octet-stream=; string, array, or =fn(req)= | =:type= |
+| =verify(req, res, buf, encoding)= | ✓ | ✓ | ✓ | ✓ | none; throw to abort (→ 403 =entity.verify.failed=) | =:verify= (passthrough fn) |
+| =strict= | ✓ | | | | =true=: only arrays/objects; primitives → 400 (LIVE ="primitive"= → 400; =strict:false= → body ="primitive"=) | =:strict?= |
+| =reviver= | ✓ | | | | =JSON.parse= reviver | =:reviver= (passthrough) |
+| =defaultCharset= | ✓ | ✓ | ✓ | | =utf-8= (urlencoded: =utf-8= or =iso-8859-1= only) | =:default-charset= |
+| =extended= | | ✓ | | | =false= (qs off; LIVE =b[c]= stays a flat key; =true= nests) | =:extended?= |
+| =parameterLimit= | | ✓ | | | 1000 → 413 =parameters.too.many= | =:parameter-limit= |
+| =depth= | | ✓ | | | 32 (qs depth when extended) → 400 on overflow | =:depth= |
+| =charsetSentinel=, =interpretNumericEntities= | | ✓ | | | =false= | kebab equivalents |
+LIVE facts: a request whose =Content-Type= does not match =type= is *skipped silently*
+(=req.body= stays =undefined=, no error); =charset=latin1= on JSON → 415 =unsupported
+charset "LATIN1"= (JSON accepts Unicode charsets only); over =limit= → 413
+=PayloadTooLargeError: request entity too large=; malformed JSON → 400 =SyntaxError=;
+=text= yields a string; =raw= yields a =Buffer=; JSON object keys arrive exactly as sent
+(=camelKey=, =x_y=) — the wrapper never re-cases *body* keys (11.1).
+*** Body-parser error types (all =http-errors=; =err.status=, =err.type=, =err.expose=, =err.body= when read) [README body-parser §Errors]
+| =err.type= | status | Meaning | Wrapper =:reason= |
+|------------+--------+---------+-------------------|
+| =encoding.unsupported= | 415 | =Content-Encoding= present but =inflate:false=, or unknown encoding | =:encoding-unsupported= |
+| =entity.parse.failed= | 400 | body could not be parsed (=err.body= = raw text) | =:parse-failed= |
+| =entity.verify.failed= | 403 | =verify= threw | =:verify-failed= |
+| =request.aborted= | 400 | client aborted (=received=, =expected= bytes) | =:aborted= |
+| =entity.too.large= | 413 | over =limit= (=limit=, =length=) | =:too-large= |
+| =request.size.invalid= | 400 | length ≠ =Content-Length= | =:size-invalid= |
+| =stream.encoding.set= | 500 | =req.setEncoding= was called earlier | =:stream-encoding-set= |
+| =stream.not.readable= | 500 | body already consumed | =:not-readable= |
+| =parameters.too.many= | 413 | urlencoded over =parameterLimit= | =:too-many-parameters= |
+| =charset.unsupported= | 415 | unknown/unsupported charset | =:charset-unsupported= |
+| (depth) | 400 | qs depth exceeded (=extended=) | =:depth-exceeded= |
+*** =express.static(root, options)= [README serve-static][DTS ServeStaticOptions][LIVE]
+| Option | Default | Notes |
+|--------+---------+-------|
+| =acceptRanges= | =true= | =Accept-Ranges: bytes= sent (LIVE) |
+| =cacheControl= | =true= | =Cache-Control: public, max-age=0= (LIVE) |
+| =dotfiles= | ='ignore'= (404 / =next()=) | ='deny'= → 403 but with =fallthrough= it becomes the 404 downstream (LIVE); ='allow'=; applies to hidden *directories* in the request path too (5.x) |
+| =etag= | =true= | weak =W/"size-mtime"= (LIVE) — independent of the app ='etag'= setting |
+| =extensions= | =false= | e.g. =['html','htm']= |
+| =fallthrough= | =true= | =false= → =next(err)= even for 404 (LIVE ENOENT stack) and the middleware answers *all* methods |
+| =immutable= | =false= | with =maxAge= |
+| =index= | ="index.html"= | =false= disables; string or array |
+| =lastModified= | =true= | LIVE header present |
+| =maxAge= | 0 | ms or =ms= string ("1d") |
+| =redirect= | =true= | directory → trailing-slash redirect (LIVE) |
+| =setHeaders(res, path, stat)= | none | synchronous; wrapper exposes it as =:set-headers (fn [path stat] -> header map)= applied by the binding |
+Path safety (LIVE): =GET /static/..%2f..%2fetc%2fpasswd= → 404; =send= resolves relative
+to =root= and refuses traversal (=res.sendFile('../x', {root})= → 403 Forbidden, 5.6).
+*** Removed / never-present built-ins
+=express.query= (4.x) is gone; =express.static.mime= is gone (use =mime-types=, which
+is an Express dependency — the wrapper does *not* expose MIME lookup, 10.11).
+
+** 4.2 Third-party middleware — deliberately out of scope (=mount= only) [README body-parser "does not handle multipart"][SRC express/lib/response.js cookie]
+| Package | Why it is not wrapped | What the wrapper offers instead |
+|---------+-----------------------+---------------------------------|
+| =cookie-parser= | adds a runtime dependency; only sets =req.cookies=, =req.signedCookies=, =req.secret= from the =Cookie= header | Phase 2 parses the =Cookie= header itself (RFC 6265 pair split + =decodeURIComponent=, mirrors =cookie.parse=) into =:cookies=; signed-cookie support via Node =crypto= HMAC is uncertainty 10.3 |
+| =multer= / =busboy= / =formidable= | multipart is large, streaming, disk-touching; body-parser explicitly excludes it | =:body= stays =nil= for =multipart/form-data=; the raw Node request is reachable through =core/with-raw= for a caller-mounted multer (=core/mount-upstream!=) |
+| =cors=, =helmet=, =compression=, =morgan=, =express-session=, =express-rate-limit= | policy libraries with their own option universes and dependencies | =core/mount-upstream!= accepts any =(req, res, next)= function object so a consumer can =js/require= one *in their own code*; the wrapper's =middleware= namespace ships small pure helpers (CORS headers as data, request id, timing, basic auth parsing) written in ClojureScript |
+| =serve-index=, =vhost=, =response-time= | niche | none |
+The rule "zero runtime npm deps beyond express + ws" is therefore kept: nothing in
+=dependencies=, and the wrapper never requires a package that is not =express= or =ws=
+(Node built-ins excepted).
+
+** 4.3 Error middleware and chains [README router][DTS ErrorRequestHandler, NextFunction][LIVE]
+- Arity decides the kind: 4 parameters =(err, req, res, next)= = error middleware; ≤ 3 =
+  normal. =[DTS NextFunction]= documents =next()=, =next(err)=, =next('route')=,
+  =next('router')=.
+- Error middleware runs *only* while an error is in the pipeline, in registration order;
+  it may respond, call =next(err)= to pass on, or =next()= to resume normal flow.
+- Async rejection semantics: section 1.4 (all handler kinds, including =param= handlers
+  and error middleware, get their rejections forwarded).
+- LIVE: an arity-4 handler mounted with =app.use('/handled', ...)= received the error and
+  answered 599 JSON; a throw inside error middleware went to the next handler.
+- Wrapper adapter (11.4): user handlers are =(fn [req-map] -> response-map | promise)=
+  and *never* see =next=; the adapter decides =next()= vs response vs =next(err)=; the
+  wrapper's final error middleware (8.5) is registered last by =core/app= and is the only
+  arity-4 function in the stack unless the user adds =:error-handler=.
+
+** 4.4 =finalhandler= 2.1.1 — the Express 5 default handler [README finalhandler][SRC finalhandler/index.js][LIVE]
+- Invoked with no error → 404 HTML =Cannot <METHOD> <path>=; with an error → status from
+  =err.status= / =err.statusCode= when 4xx–5xx else 500, =res.statusMessage= from the
+  code, headers from =err.headers= (copied), body = =err.stack= (or =err.toString()=) when
+  =env !== 'production'= else the status phrase; adds =Content-Security-Policy:
+  default-src 'none'= and =X-Content-Type-Options: nosniff=; unpipes =req=; when headers
+  were already sent it destroys the socket instead. =err.expose= is *never* read.
+- =env= comes from the app's ='env'= setting (=app.handle= passes it) and =onerror= logs
+  the stack with =console.error= unless =env === 'test'=.
+- LIVE: development bodies contain full stacks (an information leak); production bodies
+  hide even exposed 4xx messages; the =Content-Type= is always =text/html= regardless of
+  =Accept: application/json=. Hence the wrapper's own final middleware (8.5).
+* 5. req / res surface census (translation-layer spec)
+** 5.1 Request fields [DTS Request][SRC express/lib/request.js][LIVE probe-express2 with =trust proxy 'loopback'= and =X-Forwarded-*= headers]
+| Upstream | Type | req map key | Notes (LIVE) |
+|----------+------+-------------+--------------|
+| =req.method= | string upper-case | =:method= keyword lower-case (=:get=) | |
+| =req.url= | string | =:url= | mount-relative, with query |
+| =req.originalUrl= | string | =:original-url= | |
+| =req.baseUrl= | string | =:base-url= | ="" = at top level |
+| =req.path= | string | =:path= | no query |
+| =req.params= | null-proto object | =:params= | keys kebab-cased? *No*: param names are user-chosen route identifiers; they become keywords *as spelled* (=:my-name= for =:"my-name"=, =:0= for RegExp groups); values strings or vectors (wildcards) |
+| =req.query= | object | =:query= | string keys → keywords as spelled (never re-cased: =b[c]= → =:b[c]=); repeated keys → vectors; ={}= when no query |
+| =req.body= | any / undefined | =:body= | =nil= until a parser ran; JSON keys keywordised as spelled (no re-casing); =text= → string; =raw= → Buffer (opaque) |
+| =req.headers= | object, *lower-case* names (Node) | =:headers= | =:content-type= etc. (=util/->header-map=); =set-cookie= would be a vector (Node) but never occurs on requests; duplicate request headers are joined by Node (comma) except =cookie= (=; =) |
+| =req.rawHeaders= | array (original case) | — | none (10.5) |
+| =req.get(name)= / =req.header(name)= | case-insensitive lookup; =undefined= when absent | (use =:headers=) | =req.get('set-cookie')= returns an array |
+| =req.cookies= / =req.signedCookies= / =req.secret= | set by cookie-parser only | =:cookies= (wrapper-parsed map, 4.2), =:signed-cookies= (10.3) | LIVE: =undefined= without cookie-parser |
+| =req.ip= | string | =:ip= | via =proxy-addr= with the trust fn: LIVE =X-Forwarded-For: 10.0.0.9, 10.0.0.8= trusting loopback → =10.0.0.8= (nearest untrusted) |
+| =req.ips= | array | =:ips= | LIVE =["10.0.0.8"]= (the trusted chain stops at the first untrusted hop); =[]= when trust is off |
+| =req.protocol= / =req.secure= | ="http"=/="https"=, boolean | =:protocol= keyword, =:secure?= | =X-Forwarded-Proto= honoured only when trusted (LIVE =:https= / =true=) |
+| =req.host= / =req.hostname= | string | =:host= (with port), =:hostname= | =X-Forwarded-Host= when trusted (LIVE =api.example.com=); IPv6 literal aware |
+| =req.subdomains= | array | =:subdomains= | LIVE =["api"]= with offset 2 |
+| =req.xhr= | boolean | =:xhr?= | =X-Requested-With: XMLHttpRequest= |
+| =req.fresh= / =req.stale= | boolean | =:fresh?= / =:stale?= | conditional GET vs the *response* headers already set — meaningful only after =:etag=/=:last-modified= are set; the wrapper computes them lazily (10.6) |
+| =req.accepts(types)= / =acceptsEncodings= / =acceptsCharsets= / =acceptsLanguages= | negotiation (=accepts= package) | =:accepts= etc. as *pre-computed vectors* when called with no args (LIVE =["text/html","application/json"]=, =["gzip","br","identity"]=, =["en-GB","en"]=, =["*"]=), plus =core/accepts?= helpers taking the req map | q-values honoured (=application/json;q=0.9, text/html= → =html=) |
+| =req.is(type)= | string / =false= / *=null= when the request has no body* | =core/is?= | LIVE =req.is('json')= → =null= on a GET with =Content-Type= but no body |
+| =req.range(size, opts)= | =[{start,end}]= with =.type=, =-1= unsatisfiable, =-2= malformed | =core/range= → ={:type "bytes" :ranges [{:start 0 :end 99}]}= | LIVE |
+| =req.route= | route object | =:route {:path ..}= | only inside route handlers |
+| =req.app= / =req.res= / =req.next= | circular refs | — | none |
+| =req.httpVersion=, =req.socket.remoteAddress= / =remotePort= | Node | =:http-version=, =:remote-address=, =:remote-port= | LIVE ="1.1"=, ="127.0.0.1"= |
+| =req.signal= / abort | Node =req.on('close')= | =:aborted-ch= (core.async, closed when the client disconnects) | later; =res.locals= carries nothing of ours |
+The whole map is built *eagerly* except =:fresh?= / =:stale?= (need response headers) and
+=:accepts*= vectors (cheap, eager). Header names are lower-case kebab keywords by policy
+(uncertainty 10.1 settled).
+
+** 5.2 Response operations [DTS Response][SRC express/lib/response.js][LIVE]
+| Upstream | Response map form | Notes (LIVE) |
+|----------+-------------------+--------------|
+| =res.status(code)= | =:status 201= | integer 100..999 enforced upstream; wrapper validates first |
+| =res.set(field, value)= / =res.header= / =res.append(field, value)= / =res.get= | =:headers {:content-type ".." :x-multi ["1" "2"]}= | vector values are sent as repeated headers (LIVE =X-Multi: 1, 2= folded by the client; =Link= appended); =res.set= preserves the given case on the wire, Node lower-cases on read; wrapper sends lower-case |
+| =res.type(t)= / =res.contentType= | =:type :json= or =:type "text/csv"= | extension or full type (LIVE ='json'= → =application/json; charset=utf-8=) |
+| =res.send(body)= | =:body= | string → =text/html; charset=utf-8= unless a type is set; object / array / number / boolean → =res.json=; =Buffer= / =Uint8Array= → =application/octet-stream=; =null= → empty; sets =Content-Length=, weak =ETag= (setting), 304 when =req.fresh=, strips body for =HEAD= and headers for 204/304, 205 special-cased |
+| =res.json(obj)= | =:body= that is a map/vector (default) or =:json true= to force | uses ='json replacer' / 'json spaces' / 'json escape'=; =application/json; charset=utf-8= |
+| =res.jsonp= | — | none (10.11) |
+| =res.sendStatus(code)= | =:status 204= with no =:body= | sends the reason phrase as =text/plain= (LIVE 204 shows an =ETag= header, harmless) |
+| =res.sendFile(path, {root, maxAge, headers, dotfiles, etag, lastModified, acceptRanges, cacheControl, immutable}, cb)= | =:send-file {:path "package.json" :root "/abs/dir" ...}= | path must be absolute or =:root= given (LIVE =TypeError: path must be absolute or specify root=); traversal above root → 403 (LIVE); errors go to the callback (=err.status= 403/404) |
+| =res.download(path, filename, opts, cb)= | =:download {:path .. :filename "p.json" ...}= | =Content-Disposition: attachment; filename="p.json"= (LIVE); the *next* Express release drops the quotes for token-safe names (unreleased changelog) |
+| =res.attachment(filename)= | =:attachment "a b.txt"= | sets =Content-Disposition= and =Content-Type= from the extension (LIVE =text/plain=) |
+| =res.redirect([status,] url)= | =:redirect "/plain"= or =:redirect {:url ".." :status 301}= | default 302; body negotiated (=Found. Redirecting to /plain= text/plain for a non-HTML client, =<p>…</p>= for HTML); =Vary: Accept= |
+| =res.location(url)= | =:headers {:location ..}= | |
+| =res.cookie(name, value, opts)= / =res.clearCookie(name, opts)= | =:cookies [{:name "a" :value "b" :http-only? true :same-site :lax :max-age 1000}]=, =:clear-cookies [{:name "gone"}]= | object values are serialised as =j:<json>=; =maxAge= ms → =Expires= + =Max-Age= seconds; =path= defaults =/=; =clearCookie= forces =Expires=Thu, 01 Jan 1970= and drops =maxAge=; =signed:true= throws without =req.secret= (LIVE) |
+| =res.vary(field)= | =:vary ["origin"]= or =:headers {:vary ..}= | duplicates ignored (LIVE one =Origin=) |
+| =res.format({type fn ... default fn})= | =:format {:json (fn [req] ..) :text .. :default ..}= | 406 with =types= when nothing matches and no default; sets =Vary: Accept= (LIVE) |
+| =res.links({rel url})= | =:links {:next ".." :last ".."}= | =Link: <u>; rel="next", …= |
+| =res.locals= | — | not part of the map (11.4) |
+| =res.render= | — | none |
+| =res.headersSent= / =res.end= / =res.write= | streaming | =:body= may be a Node =Readable= (opaque) → piped; =:stream true= for chunked writes is =later= (10.8) |
+| =res.charset= | | none (=Content-Type= carries it) |
+Sending twice throws =ERR_HTTP_HEADERS_SENT= (LIVE) — the adapter sends exactly once.
+Cookie options census [DTS CookieOptions][README cookie]: =maxAge= (ms), =signed=,
+=expires= (Date), =httpOnly=, =path= (default =/=), =domain=, =secure=, =encode= (default
+=encodeURIComponent=), =sameSite= (=true \vert 'lax' \vert 'strict' \vert 'none'=), =priority=
+(=low \vert medium \vert high=), =partitioned=.
+
+** 5.3 Server lifecycle [DOC node http.md, net.md][LIVE probe-close.js][SRC express/lib/application.js listen]
+*** Construction and listen
+- The wrapper builds =http.createServer(app)= itself (the app is a request listener) so it
+  can (a) attach the =upgrade= listener for ws, (b) set the Node server timeouts, (c)
+  promisify =listen=. Relevant =createServer= options [DOC]: =keepAliveTimeout= (default
+  5000, plus =keepAliveTimeoutBuffer= 1000 since v22.19), =headersTimeout= (60000),
+  =requestTimeout= (300000; "must be non-zero to protect against DoS"),
+  =connectionsCheckingInterval=, =maxHeaderSize=, =joinDuplicateHeaders=,
+  =requireHostHeader=, =highWaterMark=, =noDelay=, =keepAlive= / =keepAliveInitialDelay=.
+  LIVE defaults on 22.23.2: =keepAliveTimeout 5000=, =headersTimeout 60000=,
+  =requestTimeout 300000=, =timeout 0=, =maxHeadersCount null=, =maxRequestsPerSocket 0=.
+- =server.listen(port, host, backlog, cb)=; =port 0= → ephemeral (LIVE, used by every
+  probe); =server.address()= gives ={address family port}=; listen errors arrive as an
+  ='error'= event *before* ='listening'= (=EADDRINUSE=, =EACCES=) — promisified as a
+  rejection =:express-cljs/server-error {:code :eaddrinuse}=.
+- =server.getConnections(cb)=, =server.closeIdleConnections()=, =server.closeAllConnections()=
+  and =Symbol.asyncDispose= all exist on Node 22 (LIVE typeof).
+*** Close choreography — verified live (Node 22.23.2, ws 8.21.3, 2 open ws clients + 1 idle keep-alive HTTP connection)
+| Scenario | =server.close= callback | Notes |
+|----------+-------------------------+-------|
+| A: =server.close()= alone | *never* (1.5 s timeout) | Node ≥ 19 closes *idle HTTP* keep-alive connections inside =close()= (it did: the idle agent socket did not block), but upgraded ws sockets are neither idle-HTTP nor tracked |
+| B: + =server.closeAllConnections()= | never | doc: "does *not* destroy sockets upgraded to a different protocol, such as WebSocket"; LIVE the ws clients stayed =OPEN= |
+| C: + =ws.close(1001, 'shutdown')= on every server-side client, wait 300 ms | fired after 5 ms | server-side ='close'= events =[1001 1001]=, =wss.clients= empty |
+| D: + =ws.terminate()= on every client | fired after 0 ms | close codes =[1006 1006]= (abnormal) |
+| E: + =wss.close()= alone | never | ws doc: "Existing connections are not closed automatically… If an external HTTP server is used… it must be closed manually" |
+| F: + =ws.close(1001)= then =await= each server-side ='close'= | fired after 1 ms | the deterministic form |
+House choreography (Phase 3 =core/close!=): (1) stop accepting: =server.close(cb)= (also
+reaps idle keep-alive connections on Node ≥ 19); (2) for every tracked ws client send
+=close(1001, "server shutdown")= and await its ='close'= event with a per-socket deadline
+(ws's own =closeTimeout= is 30 s; the wrapper uses =:ws-close-timeout-ms= default 2000
+then =terminate()=); (3) =wss.close()= to detach listeners; (4) after =:timeout-ms=
+(default 5000) call =server.closeAllConnections()= for stuck HTTP requests; (5) resolve
+when the =close= callback fired; (6) clear the keepalive interval (which is unref'd
+anyway, 6.7). Result: the process exits by itself — LIVE the final probe reported only
+=PipeWrap= (stdio) and the unref'd =Timeout= as active resources. =process.on('SIGTERM')=
+wiring is left to the application (=core/close!= is what it should call).
+* 6. ws 8.21.3 surface census
+** 6.1 Exports and constants [LIVE Object.keys(ws)][DTS ws]
+=CLOSED CLOSING CONNECTING OPEN PerMessageDeflate Receiver Sender Server WebSocket
+WebSocketServer createWebSocketStream extension subprotocol=; ready states =CONNECTING 0=,
+=OPEN 1=, =CLOSING 2=, =CLOSED 3=. =Server= and =WebSocketServer= are the same class.
+
+** 6.2 =new WebSocketServer(options[, callback])= [DOC ws.md][SRC ws/lib/websocket-server.js constructor][DTS ServerOptions][LIVE wss.options]
+| Option | Default | Wrapper key / scope |
+|--------+---------+---------------------|
+| =port= / =host= / =backlog= | — / — / 511 | none: the wrapper always uses =noServer= |
+| =server= | — | none (see =noServer=) |
+| =noServer= | =false= | *always =true=*; exactly one of =port= / =server= / =noServer= must be given (else =TypeError=) |
+| =path= | =null= (accept all) | none: the wrapper routes in its own =upgrade= listener (=:path= string, set of strings, or predicate on the upgrade request map) |
+| =clientTracking= | =true= (creates =wss.clients= Set) | kept =true=; the wrapper also keeps its own registry (rooms, 6.10) |
+| =maxPayload= | =104857600= (100 MiB); 0 disables | =:max-payload= — wrapper default *1 MiB* (pitfall 9.10); over-limit → error =WS_ERR_UNSUPPORTED_MESSAGE_LENGTH=, connection closed (LIVE: server ='error'= then ='close'= 1006 on the server side; the source sends 1009 to the peer) |
+| =perMessageDeflate= | =false= (server) | =:per-message-deflate= boolean or kebab option map (=serverNoContextTakeover=, =clientNoContextTakeover=, =serverMaxWindowBits=, =clientMaxWindowBits=, =zlibDeflateOptions=, =zlibInflateOptions=, =threshold= 1024, =concurrencyLimit= 10); README warns of zlib memory fragmentation |
+| =handleProtocols(protocolsSet, req) -> string \vert false= | =null= → first client-offered subprotocol is selected (LIVE =chat= from =chat,rpc=) | =:protocols= = vector of accepted names (wrapper picks the first client-offered one that is accepted) or a fn of =(offered-vector upgrade-map)= |
+| =verifyClient= | =null= | *none* (docs discourage; auth happens before =handleUpgrade=, 2.3) |
+| =autoPong= | =true= | kept |
+| =allowSynchronousEvents= | =true= | kept |
+| =skipUTF8Validation= | =false= | none (security) |
+| =closeTimeout= | 30000 | =:close-timeout-ms= (per socket; wrapper also has its own shutdown deadline, 5.3) |
+| =maxBufferedChunks= / =maxFragments= | 262144 / 16384 | kebab passthrough |
+| =WebSocket= (class) | =WebSocket= | none |
+
+** 6.3 Server events and methods [DOC ws.md][DTS Server]
+| Member | Notes |
+|--------+-------|
+| ='connection' (ws, req)= | after the handshake; =req= is the upgrade =IncomingMessage= (headers, url, socket) |
+| ='headers' (headersArray, req)= | mutate handshake response headers before they are written (e.g. a =Set-Cookie=) — wrapper =:handshake-headers (fn [upgrade-map] -> header map)= |
+| ='wsClientError' (err, socket, req)= | pre-handshake errors; the listener must write the raw HTTP response and close; without a listener ws answers a default 4xx |
+| ='error'=, ='listening'=, ='close'= | ='close'= fires when all tracked clients closed after =wss.close()= (or next tick if no tracking / no clients) |
+| =wss.clients= | =Set= of open =WebSocket= (only with =clientTracking=) |
+| =wss.close(cb)= | detaches from the HTTP server; does *not* close clients; =cb(err)= if already closed |
+| =wss.handleUpgrade(req, socket, head, cb)= | validates =Sec-WebSocket-Key=, =Sec-WebSocket-Version= (13 or 8; else 400 with a =Sec-WebSocket-Version: 13, 8= header), =shouldHandle=, subprotocol header syntax; =cb(ws, req)= on success |
+| =wss.shouldHandle(req)= | path check; overridable |
+| =wss.address()= | of the internal server only |
+
+** 6.4 =WebSocket= instance (server side) [DOC ws.md][DTS WebSocket][SRC ws/lib/websocket.js, validation.js, sender.js][LIVE]
+| Member | Notes |
+|--------+-------|
+| =readyState= | 0..3; =protocol= (selected subprotocol, ="" = when none); =extensions= (="" = without deflate); =binaryType= (=nodebuffer= default; =arraybuffer=, =fragments=, =blob=); =bufferedAmount= (bytes queued incl. framing; LIVE 0 right after small sends); =isPaused=; =url= (clients only) |
+| =send(data[, {binary, compress, fin, mask}][, cb])= | =binary= autodetected: =typeof data !== 'string'= → binary (LIVE string echoed as text, =Buffer= as binary); numbers are stringified; objects must satisfy =Buffer.from= (else =TypeError=); throws synchronously only when =CONNECTING=; when not =OPEN= the error =WebSocket is not open: readyState 3 (CLOSED)= is delivered to =cb= (LIVE; without =cb= it is emitted asynchronously, not thrown) |
+| =close([code[, reason]])= | code must be 1000..1014 minus 1004/1005/1006, or 3000..4999 (else =First argument must be a valid error code number= — LIVE for 1005 and 1004, 999); =reason= ≤ 123 bytes (=RangeError= from the sender); no code → the peer sees 1005; starts the closing handshake and a =closeTimeout= timer, =terminate()= on expiry |
+| =terminate()= | =socket.destroy()=; both sides see 1006 (LIVE) |
+| =ping(data, mask, cb)= / =pong(...)= | throw when =CONNECTING=; LIVE client =ping('p1')= → server ='ping'= event + automatic pong (=autoPong=) → client ='pong'= with the same payload |
+| =pause()= / =resume()= | stop emitting events (backpressure on *receive*) |
+| events: ='message' (data, isBinary)= | =data= is a =Buffer= for *both* text and binary with =nodebuffer= (LIVE =type "Buffer"=); text must be decoded (=toString()=); UTF-8 validated unless skipped |
+| ='close' (code, reasonBuffer)= | =reason= is a =Buffer= (LIVE =reasonType Buffer=); codes seen: 4001 (app), 1001 (shutdown), 1000 (client), 3000 (app), 1006 (terminate / receiver error) |
+| ='error' (err)= | =err.code= ∈ =WS_ERR_*= (6.12); an ='error'= listener is *mandatory* on every socket, otherwise Node throws (README examples always add one) |
+| ='ping'= / ='pong' (Buffer)= | keepalive (6.7) |
+| =addEventListener= / =on*= properties | WHATWG-style API; the wrapper uses the EventEmitter form |
+Upgrade request facts available to the ='connection'= listener (LIVE): =req.url= with the
+query string (=/ws?x=1=), all headers lower-case (=sec-websocket-protocol: "chat,rpc"=,
+=cookie=, =x-auth=, =origin=), =req.socket.remoteAddress=; the *same* Express trust-proxy
+rules do not apply here (it is a raw Node request) — the wrapper reuses its own
+=ip= / =protocol= derivation on the upgrade map with the app's trust setting (10.9).
+
+** 6.5 Message data types — binary vs text
+Sending: a CLJS string → text frame; a =Buffer= / =Uint8Array= / =ArrayBuffer= → binary
+frame; the wrapper's =ws/send!= takes ={:text s}= / ={:binary bytes}= / a plain string, or
+any CLJS value with =:json true= (serialised with =util= JSON). Receiving: the channel
+message is ={:type :text :data "…"}= or ={:type :binary :data <Buffer>}= (plus =:json=
+parsed lazily by =ws/json= or eagerly with =:decode :json= on the server). =binaryType=
+stays =nodebuffer=.
+
+** 6.6 Close codes [RFC 6455 via SRC validation.js][LIVE]
+| Code | Meaning | Who |
+|------+---------+-----|
+| 1000 | normal | either |
+| 1001 | going away (server shutdown, page navigation) | wrapper =close!= default on shutdown |
+| 1002 | protocol error | ws receiver (many paths) |
+| 1003 | unsupported data | app |
+| 1005 / 1006 | no status / abnormal (reserved; *cannot be sent*) | seen on receive only |
+| 1007 | invalid UTF-8 | ws receiver |
+| 1008 | policy violation | app (auth) |
+| 1009 | message too big | ws receiver (=maxPayload=) |
+| 1010–1014 | extension / unexpected / bad gateway / restart / try again | sendable |
+| 3000–3999 | registered by libraries/frameworks | wrapper reserves 3000–3099 for the RPC transport (7.4) |
+| 4000–4999 | private application codes | app (LIVE 4001 round-tripped with its reason) |
+
+** 6.7 Keepalive (ping/pong) and the unref precedent [README ws "How to detect and close broken connections"][DOC email-cljs parse-binding]
+- ws does *not* detect dead peers by itself; the README pattern: mark =isAlive=false=,
+  =ping()= every 30 s from one =setInterval= over =wss.clients=, =terminate()= sockets that
+  did not =pong= since the previous tick; clear the interval on =wss.close=.
+- House rule (email-cljs precedent: =parse-binding/set-timer= unref's every watcher
+  timer so an idle process exits on its own): the keepalive interval is created in the
+  binding with =timer.unref()= (LIVE sanity: an unref'd interval leaves only =Timeout= in
+  =process.getActiveResourcesInfo()= and does not keep the process alive). Wrapper
+  options: =:keepalive-ms= (default 30000, =false= disables), =:keepalive-grace-ms=
+  (default = interval), closes with =terminate()= (README recommends terminate over
+  close for dead peers).
+- Clients receive automatic pongs (=autoPong=), so the client side needs no code.
+
+** 6.8 Backpressure [DOC ws.md bufferedAmount, pause/resume][README]
+- =bufferedAmount= grows when the socket cannot flush; the wrapper's =send!= returns a
+  promise resolved on the write callback and =ws/buffered-amount= exposes the counter;
+  =:max-buffered-bytes= (default 8 MiB) makes =send!= reject with
+  =:express-cljs/ws-error {:code :backpressure}= instead of buffering unboundedly.
+- Receive side: the per-connection core.async channel has a fixed buffer
+  (=:message-buffer= default 64); when it is full the binding calls =ws.pause()= and
+  =resume()=s once the consumer drains below half (=put-or-cancel!= from the leveldb
+  precedent handles the consumer-closed case).
+
+** 6.9 Subprotocols and upgrade headers
+- Client offers =Sec-WebSocket-Protocol: a, b=; without =handleProtocols= ws selects the
+  first (LIVE); with it, the function receives a =Set= and the request and returns one
+  name or =false= (header omitted). If the client offered protocols and the server
+  selects none, browsers fail the connection — the wrapper's =:protocols= list therefore
+  answers =false= only when nothing matches, and the RPC layer registers ="express-cljs-rpc"=
+  (7.1) as an optional protocol name.
+- Any request header is readable on the upgrade request; cookies and =Authorization=
+  are the common auth carriers; the wrapper's =:authenticate (fn [upgrade-map] ->
+  ctx | promise | nil)= runs *before* =handleUpgrade= and answers 401 on =nil= / 403 on a
+  thrown =http-error=.
+
+** 6.10 Broadcast and rooms
+- README broadcast = iterate =wss.clients= and =send= to those with =readyState OPEN=
+  (optionally excluding the sender). No rooms exist upstream: *rooms/topics are a
+  wrapper-level concept* — =ws/join!= / =ws/leave!= / =ws/broadcast!= over an atom
+  ={room #{conn-id}}= kept by =express-cljs.ws=; a connection leaving (close event)
+  is removed from every room.
+
+** 6.11 Compression
+Server default off; client default on (negotiated only if the server allows). Wrapper
+default off; option passthrough as in 6.2.
+
+** 6.12 =WS_ERR_*= codes [DOC ws.md]
+=EXPECTED_FIN=, =EXPECTED_MASK=, =INVALID_CLOSE_CODE=, =INVALID_CONTROL_PAYLOAD_LENGTH=,
+=INVALID_OPCODE=, =INVALID_UTF8=, =UNEXPECTED_MASK=, =UNEXPECTED_RSV_1=, =UNEXPECTED_RSV_2_3=,
+=TOO_MANY_BUFFERED_PARTS=, =UNSUPPORTED_DATA_PAYLOAD_LENGTH=, =UNSUPPORTED_MESSAGE_LENGTH=
+→ wrapper =:express-cljs/ws-error {:code :unsupported-message-length …}= (=WS_ERR_= prefix
+dropped, kebab-cased, same rule as =util/server-error= codes).
+* 7. RPC layer design space (pre-decision for Phase 4)
+** 7.1 Frame shape over ws: JSON-RPC 2.0 vs a home-grown ={method params id}= [DOC jsonrpc.org/specification]
+| Criterion | JSON-RPC 2.0 | Home-grown |
+|-----------+--------------+------------|
+| interop | any existing client library / MCP-style tooling speaks it; error codes standardised | none |
+| envelope | =jsonrpc:"2.0"= + =method= + =params= (object *or* array) + =id= (string / number / null) → =result= xor =error {code message data}= | whatever we choose |
+| notifications | request without =id=: server MUST NOT reply | must invent |
+| batch | array of requests → array of responses; MUST NOT reply to notifications inside | must invent |
+| cost | one extra key per frame; strict =id= rules | none |
+*Recommendation: JSON-RPC 2.0, single-request only (no batch), with notifications.*
+Frames are UTF-8 *text* frames carrying one JSON document. Batch arrays are answered
+with =-32600 Invalid Request= (=data.reason = "batch not supported"=): batches add
+ordering/partial-failure semantics for no benefit on a persistent socket (ws already
+pipelines), and even the Model Context Protocol dropped them in 2025. Kept as a marker
+(=:batch?= option, uncertainty 10.13) if a consumer needs it later.
+
+** 7.2 HTTP transport: single =POST /rpc= vs per-method routes
+*Recommendation: one endpoint (default =/rpc=, configurable), same JSON-RPC body,
+=Content-Type: application/json=, response 200 with the JSON-RPC response object for
+both results *and* method errors* (per spec the transport status is independent of the
+RPC outcome); HTTP-level codes only for transport failures: 400 (parse / invalid request),
+404 (endpoint), 405 (non-POST), 413 (body limit), 415 (wrong content type), 204 for a
+notification (no =id=), 500 for a wrapper bug. Optional =:http-status-from-error? true=
+maps method errors to the status column of =util/rpc-error-codes= for REST-ish clients
+(the body stays a JSON-RPC error object). Per-method routes are not generated: they
+would duplicate the registry, fight the router's method semantics and lose the
+notification/id model.
+
+** 7.3 Shared registry
+={"name" (fn [params ctx]) …}= built by =rpc/registry= (validates names are non-empty
+strings, allows a =:schema= per method for later); the *same* registry value is passed to
+=rpc/http-routes= and =rpc/serve-ws!=; dispatch (=rpc/call!=) is one pure-ish function
+=(registry frame ctx) -> promise of response frame | nil (notification)= so the two
+transports differ only in framing and context. Method fns may return a value or a
+promise; a thrown / rejected =util/rpc-error= becomes the error object; any other error
+becomes =-32603 Internal error= with the message hidden unless =:expose-errors? true=.
+Reserved names: anything starting with =rpc.= (spec), plus the wrapper's built-ins
+=rpc.ping= (health), =rpc.methods= (introspection, opt-in).
+
+** 7.4 Error mapping (=util/rpc-error-codes=, Phase 0)
+| Wrapper code | JSON-RPC code | HTTP status (opt-in mapping) | ws |
+|--------------+---------------+------------------------------+----|
+| =:parse-error= | -32700 | 400 | error frame with =id nil= |
+| =:invalid-request= | -32600 | 400 | error frame with =id nil= (or the given id when parseable) |
+| =:method-not-found= | -32601 | 404 | error frame |
+| =:invalid-params= | -32602 | 400 | error frame |
+| =:internal-error= | -32603 | 500 | error frame |
+| =:unauthorized= / =:forbidden= | -32001 / -32002 (implementation range -32000..-32099) | 401 / 403 | error frame; a *transport-level* auth failure closes with 3000 (=rpc-unauthorized=) |
+| =:timeout= | -32003 | 504 | error frame |
+| =:application= | -32000 (+ =data= from the method) | 500 | error frame |
+ws close codes reserved by the RPC layer: 3000 unauthorized, 3001 protocol violation
+(non-JSON frames after =:strict?=), 3002 server overloaded.
+
+** 7.5 Request-id correlation, notifications
+- Server responses echo the client's =id= verbatim (string or number); =null= ids are
+  only produced for parse / invalid-request errors (spec). Client-side helper
+  =rpc/client= (Phase 4, ws only) keeps ={id promise}= and rejects all pending on close.
+- A frame without =id= is a notification: dispatched, never answered (HTTP → 204).
+- Server → client frames without =id= are *server notifications* (=rpc/notify! conn
+  "events/tick" params=), the JSON-RPC-native push mechanism (LSP / MCP style).
+
+** 7.6 Streaming results — in scope as notifications, not as a result stream
+A method that wants to stream calls =(notify! "jobs/progress" {:id id …})= from its
+=ctx= (ws only; on HTTP =notify!= is =nil= and the method should check =:transport=)
+and finally returns the result. Correlation is the request =id= inside =params= by
+convention (=:id= from ctx). A subscription API (=rpc.subscribe= built-in + rooms) is
+=later= (10.14); the primitive exists.
+
+** 7.7 Auth context injection
+- HTTP: =rpc/http-routes … {:context (fn [req-map] -> map | promise)}=; the fn sees the
+  translated request (headers, cookies, =:ip=) and returns the ctx merged with
+  ={:transport :http :request req-map}=; throwing =http-error= answers at HTTP level.
+- ws: =ws/serve! … {:authenticate (fn [upgrade-map])}= decides the handshake; the value it
+  returns is the *connection ctx* stored with the connection and merged into every call's
+  ctx as ={:transport :ws :conn conn :notify! f :id id}=.
+
+** 7.8 Proposed syntax (verbatim proposal for Phase 2–4; docstrings win once written)
+#+begin_src clojure
+(require '[express-cljs.core :as core]
+         '[express-cljs.route :as route]
+         '[express-cljs.middleware :as mw]
+         '[express-cljs.ws :as ws]
+         '[express-cljs.rpc :as rpc]
+         '[promesa.core :as p]
+         '[cljs.core.async :as async :refer [<! go-loop]])
+
+;; --- HTTP: handlers are (fn [req] -> response-map | promise | nil = fall through) ---
+(def routes
+  (route/routes
+    (route/get  "/health"        (fn [_] {:status 200 :body {:ok true}}))
+    (route/get  "/users/:id"     (fn [{:keys [params]}]
+                                   (p/let [u (db/user! (:id params))]
+                                     (if u {:body u} (throw (core/http-error 404 "no such user"))))))
+    (route/post "/users"         [(mw/json {:limit "1mb"})]           ; per-route middleware vector
+                                 (fn [{:keys [body]}] {:status 201 :body (db/create! body)}))
+    (route/get  "/files/*splat"  (fn [{:keys [params]}] {:send-file {:path (str/join "/" (:splat params))
+                                                                   :root "/srv/files"}}))
+    (route/router "/admin" {:merge-params? true}                     ; sub-router
+      (route/use  [(mw/basic-auth {:realm "admin" :check (fn [user pass] ...)})])
+      (route/get  "/" (fn [_] {:body "admin"})))
+    (route/static "/static" "/srv/public" {:dotfiles :ignore :max-age "1d"})))
+
+;; --- RPC: one registry, two transports ---
+(def methods
+  (rpc/registry
+    {"math/add"  (fn [{:keys [a b]} _ctx] (+ a b))
+     "users/get" (fn [{:keys [id]} {:keys [auth]}]
+                   (when-not auth (throw (rpc/error :unauthorized "login first")))
+                   (db/user! id))                                    ; promise ok
+     "jobs/run"  (fn [params {:keys [notify! id transport]}]
+                   (p/do (when notify! (notify! "jobs/progress" {:id id :pct 50}))
+                         (run-job! params)
+                         {:done true}))}))
+
+(def app
+  (core/app {:env :production :trust-proxy :loopback :x-powered-by? false
+             :etag :weak :query-parser :simple
+             :error-handler (fn [err req] nil)}                      ; nil = wrapper default rendering
+    routes
+    (rpc/http-routes methods {:path "/rpc"
+                              :context (fn [req] {:auth (get-in req [:headers :authorization])})
+                              :limit "256kb"})))
+
+(p/let [server (core/listen! app {:port 8080 :host "127.0.0.1"
+                                  :request-timeout-ms 120000 :keep-alive-timeout-ms 5000})
+        wss    (ws/serve! server {:path "/ws" :max-payload 1048576 :keepalive-ms 30000
+                                  :protocols ["express-cljs-rpc"]
+                                  :authenticate (fn [{:keys [headers query]}]
+                                                  (when-let [tok (:x-auth headers)]
+                                                    {:auth (verify tok)}))})]
+  ;; raw websocket use: one channel per connection, close = unsubscribe
+  (go-loop []
+    (when-let [{:keys [conn] :as ev} (<! (ws/connections wss))]      ; {:event :open :conn ..}
+      (go-loop []
+        (when-let [m (<! (ws/messages conn))]                        ; {:type :text :data "..."} | {:type :binary :data buf}
+          (ws/send! conn (str "echo " (:data m)))
+          (recur)))
+      (recur)))
+  (ws/broadcast! wss {:json {:hello "all"}})
+  (ws/join! wss conn "room:1") (ws/broadcast! wss "room:1" "hi room")
+  ;; RPC over the same socket
+  (rpc/serve-ws! wss methods {:context (fn [conn] (:auth (ws/ctx conn)))})
+  ;; shutdown: server.close + ws 1001 choreography + deadline
+  (core/close! server {:timeout-ms 5000 :ws-close-timeout-ms 2000}))
+#+end_src
+Wire frames (ws text frames and the =POST /rpc= body / response body are identical):
+#+begin_src json
+{"jsonrpc":"2.0","id":1,"method":"math/add","params":{"a":1,"b":2}}
+{"jsonrpc":"2.0","id":1,"result":3}
+{"jsonrpc":"2.0","id":2,"method":"users/get","params":{"id":"x"}}
+{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"login first"}}
+{"jsonrpc":"2.0","method":"jobs/progress","params":{"id":3,"pct":50}}      ← server notification
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+#+end_src
+Params arrive as CLJS maps with keys keywordised *as spelled* (the RPC layer, like the
+HTTP body, never re-cases user JSON; 11.1); =params= arrays arrive as vectors.
+
+* 8. Error taxonomy
+** 8.1 Express 5 default handler (=finalhandler=) — section 4.4 [SRC][LIVE]
+Status = =err.status= / =err.statusCode= in 400..599 else 500; headers from =err.headers=;
+body HTML: stack in development, reason phrase in production; =expose= ignored; 404 for
+"no error"; =Content-Type= always HTML; CSP + nosniff headers.
+** 8.2 The =err.status= / =statusCode= / =headers= / =expose= contract [README http-errors]
+=http-errors= (used by body-parser, =res.format=, serve-static/send) sets =status= and
+=statusCode= (mirrors), =expose= (=false= when ≥ 500), optional =headers= (lower-case
+names), =message=; =createError.isHttpError= duck-types. =util/error-status= (Phase 0)
+implements the same precedence for foreign errors (=:status= then =:status-code=, 4xx–5xx
+only, else 500).
+** 8.3 body-parser errors — 4.1 table (=err.type= → wrapper =:reason=).
+** 8.4 ws errors
+Socket ='error'= events carry =WS_ERR_*= codes (6.12); =close(code)= argument errors are
+synchronous =TypeError= / =RangeError=; =send= after close reports through the callback;
+=handleUpgrade= failures surface as ='wsClientError'= (pre-handshake) with the raw socket.
+Wrapper: =:express-cljs/ws-error {:code <kebab WS_ERR or :backpressure/:closed/:invalid-close-code> :close-code n :reason s :cause e}=.
+** 8.5 Wrapper mapping and rendering (implemented in =util= Phase 0; rendering Phase 2)
+| Source | Wrapper ex-info | Rendered by =core/error-response= (final arity-4 middleware) |
+|--------+-----------------+--------------------------------------------------------------|
+| handler throws / rejects =util/http-error= | =:express-cljs/http-error {:status :message :expose? :headers :body}= | status; =:headers=; body ={:error {:status :message}}= as JSON when the client accepts JSON (or the request was JSON), else =text/plain= =<status> <message>=; message shown when =:expose?= (default =< 500=) else the reason phrase |
+| handler throws anything else (ex-info with =:status=, JS Error, string) | classified by =util/error-status= | 500 (or the foreign status) with the reason phrase; message only when =:env= is not =:production= *and* =:expose-errors?= (default =true= outside production) |
+| body-parser / serve-static / =res.format= http-errors | =:express-cljs/http-error= with =:reason= from =err.type= (4.1) and =:cause= | as above (they are 4xx → exposed) |
+| no route | =core/not-found= | 404 ={:error {:status 404 :message "Not Found" :path ..}}= / text |
+| =argument-error= raised inside a handler | 400 | exposed message |
+| listen / close failures | =:express-cljs/server-error {:code :eaddrinuse …}= | promise rejection (never a response) |
+| rpc | =:express-cljs/rpc-error= | JSON-RPC error object (7.4); on HTTP status 200 unless =:http-status-from-error?= |
+Every rendering path also emits ={:event :error …}= on the server's core.async
+=events= channel (11.5) instead of =console.error=, and the wrapper sets the app ='env'=
+to =test= during its own tests to silence Express's logger.
+** 8.6 Promise-rejection forwarding
+The adapter wraps the user handler in =p/promise= + =p/catch= itself (viem =promised=
+pattern), so *promesa* rejections, synchronous throws and non-Error rejection values all
+reach =next(err)= as ex-info; Express's own forwarding (1.4) is a second net, never the
+first. Falsy rejections become =:express-cljs/server-error {:code :rejected-falsy}=.
+
+* 9. Pitfalls checklist for express-cljs (numbered)
+1. *Route registration throws.* 4.x path syntax (=/*=, =:id?=, =(regex)=) throws
+   =TypeError= at =app.get(...)= time with a =git.new/pathToRegexpError= link — surface it
+   as an argument-error at =route/…= construction, before =core/app= runs.
+2. *Wildcards are vectors and unmatched params vanish.* Never assume =(:ext params)= is
+   present; =(:splat params)= is =["a" "b"]=.
+3. *=/files/*splat= does not match =/files=.* Use =/files{/*splat}=.
+4. *No 405 from Express.* Wrong method on a known path is a 404; use =route/resource=
+   (=route(path).all=) when 405 matters.
+5. *Handlers must respond or fall through.* A resolved promise without a response stalls
+   the request; the adapter treats =nil= as =next()= and everything else as a response.
+6. *Error bodies leak stacks in development and hide messages in production* — the
+   wrapper owns error rendering (8.5). Never rely on =err.expose= with finalhandler.
+7. *=extended= query/urlencoded parsing enables =allowPrototypes=* (Express's choice) and
+   nests up to depth 32 (body) / 5 (query, qs default); keep =:simple= unless needed and
+   validate bodies.
+8. *Body parsers are silent on a wrong =Content-Type=* — =:body nil= is not an error; JSON
+   with a non-Unicode charset is a 415; =limit= defaults to 100 kb (expose =:limit=,
+   invalid strings now throw at startup).
+9. *=req.is= returns =null= (not =false=) when there is no body.* Treat =nil= as "no body".
+10. *ws =maxPayload= defaults to 100 MiB* — a single frame can allocate that much; the
+    wrapper defaults to 1 MiB and the RPC layer to 256 kb.
+11. *Static: =dotfiles :deny= turns into a 404 through =fallthrough=*, hidden directories
+    in the path are ignored (5.x), and a missing file with =fallthrough false= renders an
+    =ENOENT= stack in development.
+12. *=sendFile= needs an absolute path or =:root=* (synchronous =TypeError=); with =:root=
+    traversal is a 403 — always pass =:root=.
+13. *Keepalive timers keep Node alive* unless =unref='d (email precedent); ws's per-socket
+    =closeTimeout= (30 s) also delays exit after =close()= if the peer never answers —
+    =terminate()= on the wrapper's own deadline.
+14. *Trust proxy spoofing.* =:trust-proxy true= trusts every =X-Forwarded-*= header; use a
+    subnet/name (=:loopback=, ="10.0.0.0/8"=) or a hop count; =X-Powered-By= is on by
+    default in Express (wrapper default off).
+15. *Multipart is out of scope* (=:body nil=); mount multer yourself via =mount-upstream!=.
+16. *Signed cookies need =req.secret=* which only cookie-parser sets (LIVE throw) —
+    uncertainty 10.3.
+17. *ETag defaults*: weak ETags on every =send= / =json= (setting =:etag=), =serve-static=
+    generates its own regardless; 304s appear automatically for conditional requests —
+    tests must send fresh requests or disable =:etag=.
+18. *404 handling has three levels* (3.7): finalhandler, static fallthrough, wrapper
+    =not-found=; register the wrapper's last.
+19. *Close choreography on Node 22*: =server.close()= waits forever with open websockets;
+    =closeAllConnections()= skips upgraded sockets; =wss.close()= closes nothing —
+    close/terminate every client (5.3).
+20. *Every ws socket needs an ='error'= listener* or an emitted error crashes the process.
+21. *ws ='message'= data is a =Buffer= even for text* — decode with =toString()= only when
+    =isBinary= is false; a =Buffer= sent as-is is a binary frame.
+22. *Close code validity*: 1004/1005/1006 and <1000 / 1015..2999 throw synchronously;
+    reason strings > 123 bytes throw =RangeError=.
+23. *=res.send= of a number/boolean is JSON* (not the 4.x status shortcut); the response
+    map makes =:status= explicit so this cannot be confused.
+24. *Header case*: Node lower-cases incoming names, keeps outgoing case as given; the
+    wrapper normalises both directions to lower-case kebab keywords; =Set-Cookie= is the
+    only multi-valued response header a client must read as a list.
+25. *Sub-app settings inheritance* differs per setting (3.9); the wrapper uses routers,
+    not sub-apps, by default.
+26. *=npm audit= noise* comes from shadow-cljs, not express/ws; do not "fix" it with
+    =--force= (that would jump to shadow-cljs 3.x).
+
+* 10. Uncertain / needs verification (numbered; each with the recommended house position)
+1. *Header key casing policy.* HTTP names are case-insensitive; Node lower-cases input.
+   House position: lower-case kebab keywords (=:content-type=) in both directions,
+   =util/->header-map= / =->wire-headers= (Phase 0, tested). Original spelling
+   (=rawHeaders=) is not exposed.
+2. *Client-side close code after a =maxPayload= violation.* The server-side =close= event
+   showed 1006 (receiver error) and the source sends 1009 to the peer; the client-side
+   code was not captured. Position: document "1009 expected, verify in the Phase 3
+   tests" and make the wrapper's =ws-error= carry the =WS_ERR= code regardless.
+3. *Signed cookies without cookie-parser.* =res.cookie(signed)= only needs =req.secret=;
+   reading requires =cookie-signature.unsign= (HMAC-SHA256 base64, =s:= prefix) which is a
+   transitive dependency we must not require. Position: Phase 2 implements sign/unsign
+   with Node =crypto= inside the binding (=:cookie-secret= app option → =:signed-cookies=
+   on the req map, =:signed? true= on cookie entries); verify byte-compatibility against
+   =cookie-signature= in a test that requires it as a *dev* dependency only.
+4. *=Set-Cookie= multiplicity through =fetch=.* The LIVE probe's =Headers.forEach= showed
+   only the last cookie; this is a client artefact. Position: Phase 2 tests read
+   =headers.getSetCookie()= (Node ≥ 19.7).
+5. *=rawHeaders= / duplicate request headers.* Node joins duplicates with ", " except
+   =set-cookie= (array) and =cookie= ("; "); =joinDuplicateHeaders= changes discarding
+   rules for some headers. Position: not exposed; document.
+6. *=:fresh?= / =:stale?= timing.* They depend on response headers; a lazily computed
+   value inside the req map violates "plain map" purity. Position: expose
+   =core/fresh?= taking the req map and the intended response headers instead of map
+   keys; the map carries the raw conditional headers only.
+7. *Trust-proxy value spelling.* Express accepts booleans, numbers, CSV strings, arrays,
+   functions. Position: =:trust-proxy= accepts =true=/=false=, integer, keyword names
+   (=:loopback= → "loopback"), a vector of strings/keywords, or a fn of =(ip index)=.
+8. *Streaming responses / SSE.* =res.write= chunking is not in the response-map model.
+   Position: =later=; =:body= may be a Node =Readable= (opaque, piped) in Phase 2 so SSE
+   can be built on a =PassThrough= from the binding; a first-class =:stream= map is a
+   Phase 5+ marker.
+9. *Upgrade request =ip= / =protocol=.* The upgrade =IncomingMessage= is not an Express
+   request, so =req.ip= does not exist there. Position: the wrapper derives =:ip=,
+   =:ips=, =:protocol=, =:host= for the upgrade map with the *same* trust setting
+   through =proxy-addr= semantics reimplemented in CLJS for the three named subnets +
+   CIDR (small) — or, simpler, calls the Express request prototype getters by
+   =Object.setPrototypeOf(upgradeReq, app.request)= inside the binding (what Express
+   itself does in =app.handle=). Recommended: the prototype trick (zero reimplementation,
+   verified pattern in =application.js=).
+10. *=express-ws= compatibility with express 5 GA.* Only the alpha peer range is evidence;
+    not tested here since it is rejected anyway (2.4).
+11. *=res.jsonp=, =res.render=, views, MIME lookup, =app.engine=.* Position: =none= for v1
+    (API server library); revisit if a consumer needs server-rendered HTML.
+12. *=app.locals= / =res.locals=.* Position: not modelled; handler closures and the ctx
+    map replace them; =res.locals= stays empty (Express initialises it).
+13. *JSON-RPC batch.* Position: rejected with -32600 in Phase 4; =:batch?= option is a
+    marker.
+14. *RPC subscriptions / result streams.* Position: notifications + rooms primitives in
+    Phase 3/4; a =rpc.subscribe= convention is =later=.
+15. *=QUERY= method.* Present on Node 22 and therefore on Express; semantics (safe,
+    cacheable) are still an IETF draft. Position: exposed as =route/query= when the
+    binding reports it; no special casing.
+16. *Unreleased Express changes* (Content-Disposition without quotes, =res.send= not
+    setting =Content-Length= with =Transfer-Encoding=, default error handler logging the
+    whole error object). Position: tests do not assert exact =Content-Disposition= bytes.
+17. *ws =closeTimeout= interaction with the wrapper deadline.* Two timers race
+    (ws 30 s vs wrapper 2 s → =terminate()=). Position: the wrapper's =terminate()= wins;
+    verify no double ='close'= event in Phase 3 tests (ws guards this in =close()=, SRC).
+18. *Node =shouldUpgradeCallback= (22.21+).* Could replace the manual 404 for non-ws
+    paths. Position: not used (portability to Node 18/20); the manual raw response stays.
+19. *Body-parser =verify= / =reviver= / =type= function options* need JS functions with
+    Node objects (=req=). Position: passthrough (=option-passthrough-keys=), documented as
+    "you receive Node objects"; =:type= as string/vector is the supported form.
+20. *=@types/*= drift.* The =.d.ts= census is from DefinitelyTyped, not Express; where it
+    disagreed with the installed source nothing was found, but new options (e.g.
+    body-parser =depth=, cookie =partitioned=) show up in typings first. Position: the
+    installed *source* wins in every docstring citation.
+
+* 11. Implementation notes for express-cljs
+** 11.1 Kebab-case translation (implemented in =util=, Phase 0)
+| Dialect | Where | Rule | Helper |
+|---------+-------+------+--------|
+| camelCase | middleware / static / cookie / ws options; upstream error fields | mechanical =kebab->camel= / =camel->kebab=; =?= suffix stripped; nil dropped; passthrough for user blobs (=:body :locals :headers :set-headers :verify :reviver :type :handle-protocols :verify-client :server :query :params :data=) | =->camel-keys=, =->kebab-keys=, =normalize-opts=, =check-opts!= |
+| space-separated settings | =app.set= | =:trust-proxy= → ="trust proxy"=; =:x-powered-by= / =:etag= keep their dash | =kebab->setting=, =setting->kebab= |
+| lower-case header names | =req.headers=, response =:headers= | lower-case both ways; vector = multi-valued | =header-name=, =header-keyword=, =->header-map=, =->wire-headers= |
+| user JSON (bodies, RPC params/results, query keys, route param names) | never re-cased; keys keywordised *as spelled* | — | binding =->clj= with =:keywordize-keys= only |
+| enums | =:lax= → "lax", =:same-origin= → "sameOrigin", =:weak= → "weak" | =enum-value= |
+** 11.2 Single binding namespace (=express-cljs.core=)
+The only file that =require=s ="express"=, ="ws"=, ="http"=, ="crypto"=, ="stream"=; house
+style =js-invoke= + =goog.object= (=util/jsget= pattern from viem-cljs, to be added to
+=util= in Phase 2 *as the one interop helper*), no =^js=, no dot-forms. It owns: app +
+server construction, the request → map translation (5.1), the response map → =res=
+adapter (5.2), the handler adapter (=nil= → =next()=, map → send, promise → await,
+throw → =next(err)=), the error renderer, the upgrade listener, ws socket wrapping into
+connection records with channels, the keepalive timer (unref'd), and =close!=.
+=route= / =middleware= / =ws= / =rpc= are plain ClojureScript over =core= functions.
+** 11.3 The req map (fields enumerated)
+={:method :url :original-url :base-url :path :params :query :body :headers :cookies
+:signed-cookies :ip :ips :protocol :secure? :host :hostname :subdomains :xhr?
+:http-version :remote-address :remote-port :accepts :accepts-encodings :accepts-charsets
+:accepts-languages :content-type :content-length :route :app-env :transport}= plus
+metadata =^{:express-cljs/raw {:req req :res res}}= reachable only by =core= helpers
+(=core/with-raw= for =mount-upstream!=). =:transport= is =:http= (RPC ctx reuses the key).
+** 11.4 The response map
+={:status 200 :headers {} :body v :type kw|str :json bool :cookies [..] :clear-cookies [..]
+:vary [..] :links {..} :redirect s|{:url :status} :send-file {:path :root ..} :download {..}
+:attachment s :format {..} :end true}=; exactly one of =:body= / =:redirect= / =:send-file=
+/ =:download= / =:format= / =:end=; =nil= from a handler means "not mine" (=next()=), a
+map without any body key means an empty response with =:status= (default 200; 204 when
+=:end=). A thrown =util/http-error= is the error path. Unknown keys → argument-error.
+** 11.5 core.async design (Phase 3)
+- =ws/connections wss= → channel of ={:event :open :conn c}= / ={:event :close :conn c :code :reason}=
+  (buffer 64, =put-or-cancel!= from the leveldb precedent; closing the channel
+  unsubscribes).
+- =ws/messages conn= → one channel per connection, ={:type :text|:binary :data ..}=, closed
+  when the socket closes; full buffer → =pause()=.
+- =core/events server= → ={:event :error|:listening|:close|:request-error ...}=.
+- Sends are promises (=send!= resolves on the write callback), never channels.
+** 11.6 Test strategy
+Ephemeral loopback port per test (=listen! {:port 0}=), Node =fetch= (global on 22) and
+the =ws= client (already installed) inside =test_util= only; every test closes the server
+with =close!= and asserts the port is released; the app ='env'= is =test= (Express's
+logger stays quiet); a final "process exits" assertion runs in the Phase 5 smoke, not in
+the unit suite.
+
+* 12. Phase 2/3/4 implementation outline
+** 12.1 =express-cljs.core= (Phase 2, the only interop namespace)
+=app= (opts & routes/middleware) · =listen!= (app opts) → promise of server handle ·
+=close!= (server opts) · =address= · =listening?= · =connections!= · =events= (channel) ·
+=http-error= (re-export of util) · =not-found= · =error-response= · =mount-upstream!=
+(path, js middleware fn) · =with-raw= · =accepts?= / =is?= / =fresh?= / =range= (req helpers) ·
+=methods= (keyword set from Node) · =set-setting!= / =setting= · internal: =req->map=,
+=respond!=, =handler-adapter=, =error-adapter=, =cookie-sign= / =cookie-unsign=, =parse-cookies=.
+** 12.2 =express-cljs.route= (Phase 2, pure data → registration through core)
+=routes= · =get post put patch delete head options all query= (path [middleware] handler) ·
+=use= (path? middleware…) · =router= (path opts & routes) · =resource= (path {:get f :post f …} → 405 for the rest) ·
+=static= (path root opts) · =param= (name fn) · =check-path= · =compile= (routes → registration plan; testable without a server).
+** 12.3 =express-cljs.middleware= (Phase 2)
+=json urlencoded text raw= (option maps → upstream parsers via core) · =request-id= ·
+=timing= · =cors= (headers as data, preflight) · =basic-auth= · =bearer-auth= · =rate-limit=
+(in-memory token bucket, marker) · =compose= · =when= / =unless= (predicate wrappers).
+** 12.4 =express-cljs.ws= (Phase 3)
+=serve!= (server opts) · =connections= · =messages= · =send!= · =broadcast!= · =close!= (conn code reason) ·
+=terminate!= · =ctx= (conn) · =upgrade= (conn → upgrade map) · =join!= / =leave!= / =rooms= · =clients= ·
+=buffered-amount= · =json= (message → parsed) · =ping!= · =stop!= (wss).
+** 12.5 =express-cljs.rpc= (Phase 4)
+=registry= · =error= (= util/rpc-error) · =call!= (registry frame ctx) · =http-routes= (registry opts) ·
+=serve-ws!= (wss registry opts) · =notify!= (conn method params) · =broadcast-notify!= ·
+=parse-frame= / =response-frame= / =error-frame= (pure) · =client= (ws client helper) · =methods= (introspection).
+** 12.6 =express-cljs.util= — Phase 0 (done)
+Case/setting/header translation, option normalisation and whitelists, reason phrases,
+=http-error= / =server-error= / =ws-error= / =rpc-error= / =argument-error=, =error-data=
+/ =error-type= / =error-status= / =rpc-error-code=, =rpc-error-codes= table.
+
+* 13. Sources
+** npm registry (=npm view=, 2026-09-25)
+- express: =dist-tags {latest 5.2.1, latest-4 4.22.3}=; ws: 8.21.3; express-ws: 5.0.2 (=time.modified= 2022-06-17), peer =express ^4.0.0 || ^5.0.0-alpha.1=, dependency =ws ^7.4.6=.
+- =npm audit= (this repo, 2026-09-25): 6 low, all via shadow-cljs → node-libs-browser → crypto-browserify / elliptic.
+** Installed packages (=node_modules=, 2026-09-25)
+- express 5.2.1 (=lib/application.js=, =lib/express.js=, =lib/request.js=, =lib/response.js=, =lib/utils.js=), router 2.2.0 (README), path-to-regexp 8.4.2 (Readme.md), body-parser 2.3.0 (README), serve-static 2.2.1 (README), send 1.2.1 (README), finalhandler 2.1.1 (README + index.js), http-errors 2.0.1 (README), qs 6.16.0 (README), cookie 0.7.2 (README), cookie-signature (Readme), proxy-addr 2.0.7 (README).
+- ws 8.21.3 (=lib/websocket-server.js=, =lib/websocket.js=, =lib/validation.js=, =lib/receiver.js=, =lib/sender.js=, =lib/constants.js=, package.json).
+- @types/express 5.0.6, @types/express-serve-static-core 5.1.3, @types/serve-static, @types/body-parser, @types/ws 8.18.1.
+- express-ws 5.0.2 (=lib/index.js=, =lib/add-ws-method.js=, =lib/websocket-url.js=, =lib/wrap-middleware.js=, README) — census install in the job tmp dir only.
+** Official documentation (fetched 2026-09-25)
+- https://expressjs.com/en/guide/migrating-5.html (rendered; the markdown source is not published on GitHub at the historical paths)
+- https://expressjs.com/en/5x/api/application/ (application settings, trust proxy and etag option tables)
+- https://expressjs.com/en/5x/api.html (index; client-rendered, used for navigation only)
+- https://raw.githubusercontent.com/expressjs/express/master/History.md (5.0.0-alpha.1 … 5.2.1 + unreleased)
+- https://raw.githubusercontent.com/websockets/ws/master/doc/ws.md and …/README.md (matched against the installed 8.21.3 sources)
+- https://raw.githubusercontent.com/nodejs/node/v22.x/doc/api/http.md (=server.close=, =closeAllConnections=, =closeIdleConnections=, ='upgrade'=, timeouts, =createServer= options) and …/net.md
+- https://www.jsonrpc.org/specification (request/response/error objects, reserved codes, notifications, batch)
+- Web search cross-checks (2026-09-25): expressjs.com migration guide summary; express-ws GitHub issues/releases; Node graceful-shutdown articles (used only to locate the official docs above); JSON-RPC 2.0 summaries.
+** GitHub API (2026-09-25)
+- HenningM/express-ws: last commit 2021-06-07, pushed_at 2024-07-28, open issues 82, not archived, 881 stars.
+- websockets/ws: pushed_at 2026-09-04, open issues 5, release 8.21.3 published 2026-08-06, 22,806 stars.
+** Live probes (2026-09-25, Node v22.23.2, Linux x64; scripts in the job tmp dir, not part of the repo)
+- =probe-express.js=: settings defaults, exports, 12 path-syntax cases, async/sync/non-Error/falsy/status/expose/next rejections, =res.status= validation, send/json/buffer/number bodies, redirect, cookies, signed-cookie throw, type/format/attachment/vary/append/links/jsonp, sendFile (root, relative, traversal), download, locals, double send, =next('route')=, =app.param= (sync + async rejection), Router mergeParams, sub-app mount, strict/case defaults, json/urlencoded/text/raw parsers with limit/strict/charset/type mismatches, static (dotfiles ignore/deny, fallthrough, traversal, directory redirect), =app.all=, =route().all= 405, arity-4 handlers, error-in-error, 404 / wrong-method / HEAD / OPTIONS.
+- =probe-express2.js= (development and =NODE_ENV=production=): full request map under =trust proxy 'loopback'= with =X-Forwarded-*=, =accepts*=, =is=, =range=, error bodies for 500 / 422 / 429-with-headers / 404 / JSON parse error, =Accept: application/json= ignored by finalhandler.
+- =probe-ws.js=: ws exports/constants/option defaults, subprotocol selection, upgrade headers, text/binary echo, ping/pong, bufferedAmount, maxPayload violation, server/client/app close codes, invalid close codes, terminate, non-ws upgrade path 404, send after close, first close-choreography observation.
+- =probe-close.js=: scenarios A–F of section 5.3 and the unref'd-interval liveness check.
