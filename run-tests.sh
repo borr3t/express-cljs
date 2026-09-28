@@ -11,14 +11,18 @@
 # shell, but nothing placed after the exec line inside this file would run).
 #
 # The tests never touch the network beyond the loopback interface: `npm install`
-# (first run only) fetches the toolchain plus `express`/`ws`; server tests (Phase 2+)
+# (first run only) fetches the toolchain plus `express`/`ws`; server tests
 # listen on an ephemeral 127.0.0.1 port and close it before the process exits.
+#
+# The publicity gate runs FIRST: src/ and README.md are public documentation.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ ! -d node_modules ]; then
   npm install
 fi
+
+bash test/publicity_gate.sh
 
 npx shadow-cljs compile node-test --config-merge '{:autorun false}'
 exec node target/node-test.js

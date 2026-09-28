@@ -9,13 +9,13 @@
    Pure: no I/O and no JavaScript interop. Converting CLJS maps to JS option
    objects, reading fields off req / res / socket objects and translating
    thrown JS errors is interop and therefore lives in the single binding
-   namespace (express-cljs.core, Phase 2); this namespace only deals in
-   strings, keywords and maps. Later phases add request/response map
-   normalisation here (inventory §10)."
+   namespace (express-cljs.core); this namespace only deals in strings,
+   keywords and maps, including the pure policy of request and response
+   map normalisation."
   (:require [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
-;; kebab-case <-> camelCase (inventory 10.1: express.json/static/urlencoded
+;; kebab-case <-> camelCase (express.json/static/urlencoded
 ;; options, res.cookie options and every ws option are camelCase)
 ;; ---------------------------------------------------------------------------
 
@@ -62,7 +62,7 @@
 
 (def option-passthrough-keys
   "Kebab keys whose subtree is handed upstream verbatim: user data and
-   opaque callbacks / objects (inventory 10.1)."
+   opaque callbacks / objects."
   #{:body :locals :headers :set-headers :verify :reviver :replacer :type
     :handle-protocols :verify-client :server :query :params :data})
 
@@ -89,7 +89,7 @@
   (if (keyword? v) (kebab->camel v) v))
 
 ;; ---------------------------------------------------------------------------
-;; express app settings (inventory 3.9: `app.set('trust proxy', ..)` names
+;; express app settings (`app.set('trust proxy', ..)` names
 ;; are lower-case words separated by spaces, not camelCase)
 ;; ---------------------------------------------------------------------------
 
@@ -111,10 +111,9 @@
   (keyword (str/replace (str/lower-case (name s)) #"\s+" "-")))
 
 ;; ---------------------------------------------------------------------------
-;; HTTP header names (inventory 9.1: header names are case-insensitive on the
-;; wire and Node lower-cases every incoming one; the house policy is a
-;; lower-case kebab keyword, :content-type, in every map the library returns
-;; and accepts)
+;; HTTP header names (header names are case-insensitive on the wire and
+;; Node lower-cases every incoming one; the library's policy is a lower-case
+;; kebab keyword, :content-type, in every map it returns and accepts)
 ;; ---------------------------------------------------------------------------
 
 (defn header-name
@@ -184,7 +183,7 @@
   (and (integer? status) (<= 100 status 599)))
 
 ;; ---------------------------------------------------------------------------
-;; Option normalisation (inventory 10.1: `?`-suffixed booleans; upstream
+;; Option normalisation (`?`-suffixed booleans; upstream
 ;; silently ignores unknown option keys, so the wrapper whitelists them)
 ;; ---------------------------------------------------------------------------
 
@@ -226,7 +225,7 @@
   opts)
 
 ;; ---------------------------------------------------------------------------
-;; Errors (inventory §8)
+;; Errors
 ;; ---------------------------------------------------------------------------
 
 (def error-types
@@ -250,7 +249,7 @@
    argument-error otherwise); `message` defaults to the reason phrase.
    Data: {:type :express-cljs/http-error :status .. :message .. :expose? ..}
    plus `data` (:headers, :body, :cause). `:expose?` defaults to true for
-   4xx and false for 5xx (the http-errors convention, inventory 8.3): only
+   4xx and false for 5xx (the http-errors convention): only
    exposed messages are sent to the client."
   ([status] (http-error status nil nil))
   ([status message] (http-error status message nil))
@@ -289,7 +288,7 @@
 
 (def rpc-error-codes
   "RPC error keyword -> the JSON-RPC 2.0 numeric code it maps to on the wire
-   (inventory §7.5) and the HTTP status the HTTP transport answers with."
+   and the HTTP status the HTTP transport answers with."
   {:parse-error      {:code -32700 :status 400}
    :invalid-request  {:code -32600 :status 400}
    :method-not-found {:code -32601 :status 404}
@@ -334,8 +333,8 @@
   "The HTTP status to answer with for any thrown value: the :status of an
    http-error, the mapped status of an rpc-error, 400 for an
    argument-error, a numeric :status / :status-code field on any other
-   ex-info or JS error data map when in 400..599, else 500 (inventory
-   8.2: express 5 itself honours err.status / err.statusCode the same way)."
+   ex-info or JS error data map when in 400..599, else 500 (express 5
+   itself honours err.status / err.statusCode the same way)."
   [e]
   (let [d (or (ex-data e) {})
         t (error-type e)]
@@ -354,13 +353,12 @@
     (:code (error-data e))))
 
 ;; ---------------------------------------------------------------------------
-;; Phase 2 additions: pure translation policy shared by core / route /
-;; middleware (inventory §5, §8.5, §10.6, §10.7). Still no interop: strings,
-;; keywords, maps.
+;; Pure translation policy shared by core / route / middleware. Still no
+;; interop: strings, keywords, maps.
 ;; ---------------------------------------------------------------------------
 
 (defn trust-proxy-setting
-  "Translates the wrapper's `:trust-proxy` spellings (inventory 10.7) into
+  "Translates the wrapper's `:trust-proxy` spellings into
    the value Express's 'trust proxy' setting accepts: booleans and integers
    (hop count) pass through, a keyword names a proxy-addr subnet alias
    (:loopback -> \"loopback\", also :linklocal, :uniquelocal), a string is
@@ -381,7 +379,7 @@
 
 (def app-option-keys
   "Every option `core/app` accepts (kebab, `?` stripped). The first group
-   maps 1:1 onto Express settings (inventory 3.9); the second configures
+   maps 1:1 onto Express settings; the second configures
    the wrapper itself."
   #{:env :trust-proxy :x-powered-by :case-sensitive-routing :strict-routing
     :query-parser :etag :json-escape :json-replacer :json-spaces :subdomain-offset
@@ -394,7 +392,7 @@
    `app.set`. Enum keywords are rendered (:weak -> \"weak\", :extended ->
    \"extended\"), `:env` becomes a string, `:trust-proxy` goes through
    trust-proxy-setting. Absent keys are absent (Express keeps its default),
-   except `:x-powered-by`, which defaults to false (pitfall 9.14)."
+   except `:x-powered-by`, which defaults to false."
   [opts]
   (let [opts (normalize-opts opts)
         pick (fn [m k f] (if (contains? opts k) (assoc m (kebab->setting k) (f (get opts k))) m))]
@@ -411,7 +409,7 @@
         (pick :subdomain-offset identity))))
 
 (def body-parser-reasons
-  "body-parser `err.type` -> wrapper `:reason` keyword (inventory 4.1)."
+  "body-parser `err.type` -> wrapper `:reason` keyword."
   {"encoding.unsupported" :encoding-unsupported
    "entity.parse.failed" :parse-failed
    "entity.verify.failed" :verify-failed
@@ -434,11 +432,11 @@
 
 (def response-body-keys
   "Response map keys that decide *how* the response ends; at most one may be
-   present (inventory 11.4)."
+   present."
   #{:body :redirect :send-file :download :format :end})
 
 (def response-keys
-  "Every key a response map may carry (inventory 11.4)."
+  "Every key a response map may carry."
   (into response-body-keys
         #{:status :headers :type :json :cookies :clear-cookies :vary :links :attachment}))
 
@@ -469,7 +467,7 @@
       r)))
 
 (defn accepts-json?
-  "Content negotiation for the wrapper's own error bodies (inventory 8.5):
+  "Content negotiation for the wrapper's own error bodies:
    true when the request map's :accepts vector (pre-computed from the Accept
    header, most preferred first) names JSON — or a wildcard — before any
    text/html type, or when the request itself carried a JSON body. An
@@ -485,7 +483,7 @@
                  (and (nil? first-relevant) (empty? (:accepts req)))))))
 
 (defn error-response
-  "Renders any thrown value as a response map (inventory 8.5), without
+  "Renders any thrown value as a response map, without
    touching `res`: an http-error keeps its :status, :headers and, when
    :expose? is true, its :message and optional :body; every other error is
    classified by error-status and shows its message only when

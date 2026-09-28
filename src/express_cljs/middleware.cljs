@@ -1,12 +1,12 @@
 (ns express-cljs.middleware
-  "Middleware helpers (inventory §4, §12.3). Pure ClojureScript, no interop.
+  "Middleware helpers. Pure ClojureScript, no interop.
 
    Two kinds live here:
 
    - DESCRIPTORS for Express's built-in middleware — `json`, `urlencoded`,
      `text`, `raw` (body-parser 2.3) and `static` (serve-static 2.2). They
      are data (`{:express-cljs/builtin :json :opts {...}}`) validated
-     against the option whitelists of inventory 4.1; the binding
+     against `parser-option-keys` / `static-option-keys`; the binding
      instantiates the upstream middleware when the plan is registered.
      Put them in a `:use` slot, a route chain, or `core/app` options.
 
@@ -27,7 +27,7 @@
             [express-cljs.util :as util]))
 
 ;; ---------------------------------------------------------------------------
-;; Built-in middleware descriptors (inventory 4.1)
+;; Built-in middleware descriptors
 ;; ---------------------------------------------------------------------------
 
 (def body-parser-option-keys
@@ -38,7 +38,7 @@
   #{:limit :inflate :type :verify})
 
 (def parser-option-keys
-  "Per-parser option whitelists (inventory 4.1 table)."
+  "Per-parser option whitelists."
   {:json (into body-parser-option-keys #{:strict :reviver :default-charset})
    :urlencoded (into body-parser-option-keys #{:extended :parameter-limit :depth :default-charset
                                               :charset-sentinel :interpret-numeric-entities})
@@ -56,14 +56,14 @@
    (\"100kb\"), :strict? (true: only objects/arrays), :inflate?, :type,
    :verify, :reviver, :default-charset. Malformed JSON -> 400
    :parse-failed; over :limit -> 413 :too-large; a non-matching
-   Content-Type is skipped silently (:body stays nil, pitfall 9.8)."
+   Content-Type is skipped silently (:body stays nil)."
   ([] (json {}))
   ([opts] (builtin :json opts)))
 
 (defn urlencoded
   "express.urlencoded descriptor: `application/x-www-form-urlencoded` ->
    :body map. Options: :limit, :extended? (default false: flat keys;
-   true nests `a[b]` via qs with allowPrototypes — pitfall 9.7),
+   true nests `a[b]` via qs with allowPrototypes),
    :parameter-limit (1000), :depth (32), :inflate?, :type, :verify,
    :default-charset, :charset-sentinel?, :interpret-numeric-entities?."
   ([] (urlencoded {}))
@@ -82,7 +82,7 @@
   ([opts] (builtin :raw opts)))
 
 (def static-option-keys
-  "express.static options (inventory 4.1): :accept-ranges?, :cache-control?,
+  "express.static options: :accept-ranges?, :cache-control?,
    :dotfiles (:allow / :deny / :ignore), :etag?, :extensions (vector),
    :fallthrough? (default true), :immutable?, :index (string / vector /
    false), :last-modified?, :max-age (ms or \"1d\"), :redirect?,
@@ -92,7 +92,7 @@
 
 (defn static
   "express.static descriptor serving files below `root` (an absolute
-   directory; traversal above it is refused upstream, inventory 4.1).
+   directory; traversal above it is refused upstream).
    Mount it with a path: `(route/use \"/static\" (static \"/srv/pub\"))` or
    `(route/static \"/static\" \"/srv/pub\" opts)`. Defaults: dotfiles
    ignored (404), `index.html` served for directories, weak ETag,

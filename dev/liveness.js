@@ -9,4 +9,4 @@ process.on('exit', () => {
 });
 const watchdog = setTimeout(() => { console.log('[liveness] FAIL: still alive 15 s after start; active resources:', JSON.stringify(process.getActiveResourcesInfo())); realExit(2); }, 15000);
 watchdog.unref();
-require('/home/borret/parts/express-cljs/target/node-test.js');
+require('../target/node-test.js');

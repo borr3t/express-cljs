@@ -23,7 +23,14 @@
               :ns-regexp "-test$"
               :autorun true}
 
-  ;; Phase 5 localhost smoke: a real 127.0.0.1 server (HTTP + ws + RPC over both)
+  ;; The examples of the README (dev/express_cljs/examples.cljs), OFFLINE: real
+  ;; servers on the loopback interface, stubs behind the handlers:
+  ;;   npx shadow-cljs compile examples && node target/examples.js
+  :examples {:target :node-script
+             :main express-cljs.examples/main
+             :output-to "target/examples.js"}
+
+  ;; Localhost smoke: a real 127.0.0.1 server (HTTP + ws + RPC over both)
   ;; exercised end to end, numbered PASS/FAIL lines + tally; the process must
   ;; exit BY ITSELF (no process.exit) — liveness is part of the check.
   ;;   npx shadow-cljs compile smoke && node target/smoke.js

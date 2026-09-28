@@ -1,5 +1,5 @@
 (ns express-cljs.route
-  "Routing as data (inventory §3, §12.2). Pure ClojureScript: this namespace
+  "Routing as data. Pure ClojureScript: this namespace
    never touches Express; it turns route descriptions into a *registration
    plan* (a vector of op maps) that `express-cljs.core/app` executes in
    order. Two equivalent input forms exist and can be mixed freely:
@@ -27,7 +27,7 @@
       ordered form when their position matters.
 
    2. The ORDERED form — `(routes entry ...)` or a plain vector of entries,
-      registered exactly in source order (Express semantics, inventory 3.3).
+      registered exactly in source order (Express semantics).
       Entries come from the constructors below (`get`, `post`, `use`,
       `router`, `resource`, `static`, `param`, `error`, ...), from the tuple
       shorthand `[:get \"/path\" handler ...]` / `[:use \"/path\" mw ...]`, or
@@ -43,7 +43,7 @@
    upstream Express middleware) or a vector of handlers (a chain).
 
    `check-path` lints the three Express 4 spellings that path-to-regexp 8
-   rejects (inventory 3.1) so the failure names the route, not an index."
+   rejects so the failure names the route, not an index."
   (:refer-clojure :exclude [get use compile methods])
   (:require [clojure.string :as str]
             [express-cljs.util :as util]))
@@ -53,8 +53,8 @@
 ;; ---------------------------------------------------------------------------
 
 (def methods
-  "The lower-case method keywords Express 5 exposes on Node 22 (inventory
-   3.2: derived from http.METHODS, 35 names including :query). `core/methods`
+  "The lower-case method keywords Express 5 exposes on Node 22 (derived
+   from http.METHODS, 35 names including :query). `core/methods`
    is the runtime truth; this static set validates tables before any
    binding call."
   #{:acl :bind :checkout :connect :copy :delete :get :head :link :lock :m-search
@@ -67,7 +67,7 @@
   [:param :use :routers :resource :error])
 
 ;; ---------------------------------------------------------------------------
-;; Flow-control sentinels (inventory 3.3 next('route') / next('router'))
+;; Flow-control sentinels (Express's next('route') / next('router'))
 ;; ---------------------------------------------------------------------------
 
 (defn next-route
@@ -121,7 +121,7 @@
 (defn error-handler
   "Descriptor for an error handler `(fn [err req] -> response-map | nil |
    promise)`: runs only while an error is in the pipeline (Express arity-4
-   middleware, inventory 4.3); nil passes the error on, a response map
+   middleware); nil passes the error on, a response map
    answers, a throw replaces the error. `err` is always an ex-info (foreign
    errors are normalised by the binding)."
   [f]
@@ -131,8 +131,8 @@
 
 (defn upstream
   "Descriptor for a caller-supplied Express middleware function
-   `(req, res, next)` (a `js/require`d cors / helmet / multer instance,
-   inventory 4.2). The wrapper never requires such packages itself."
+   `(req, res, next)` (a `js/require`d cors / helmet / multer instance).
+   The wrapper never requires such packages itself."
   [f]
   (when-not (fn? f)
     (throw (util/argument-error "upstream: expected a middleware function" {:arg :f :value f})))
@@ -157,8 +157,8 @@
 ;; ---------------------------------------------------------------------------
 
 (defn check-path
-  "Validates a route path before it reaches path-to-regexp 8 (inventory
-   3.1): a string in Express 5 syntax, a RegExp, or a non-empty vector of
+  "Validates a route path before it reaches path-to-regexp 8: a string in
+   Express 5 syntax, a RegExp, or a non-empty vector of
    those. The three Express 4 spellings are rejected with a clearer
    message than upstream's `Unexpected ( at index 4`: `:id?` (use
    `{/:id}`), `(regexp)` groups inside strings (use a RegExp path), and an
@@ -242,20 +242,20 @@
 (defn delete  "DELETE route entry (see `route`)."  [path & handlers] (apply route :delete path handlers))
 (defn head    "HEAD route entry (see `route`)."    [path & handlers] (apply route :head path handlers))
 (defn options "OPTIONS route entry (see `route`)." [path & handlers] (apply route :options path handlers))
-(defn query   "QUERY route entry (see `route`; uncertainty 10.15)." [path & handlers] (apply route :query path handlers))
+(defn query   "QUERY route entry (see `route`)." [path & handlers] (apply route :query path handlers))
 (defn all     "Entry matching every method (Express app.all)." [path & handlers] (apply route :all path handlers))
 
 (defn use
   "Middleware entry: `(use mw ...)` mounts at \"/\", `(use \"/api\" mw ...)`
    at a prefix (Express app.use: the prefix is stripped from :url / :path
-   and kept in :base-url, inventory 3.4). Handlers may be functions
+   and kept in :base-url). Handlers may be functions
    (nil -> next), descriptors, or a nested router entry."
   [& args]
   (let [[path handlers] (if (string? (first args)) [(first args) (rest args)] ["/" args])]
     {:op :use :path (check-path path) :handlers (flatten-handlers :use path handlers)}))
 
 (def router-option-keys
-  "Options of a nested router (inventory 1.3): :merge-params?,
+  "Options of a nested router: :merge-params?,
    :case-sensitive?, :strict?."
   #{:merge-params :case-sensitive :strict})
 
@@ -277,7 +277,7 @@
 
 (defn resource
   "One path with per-method handlers and an automatic 405 for every other
-   method (Express app.route(path).get(..).post(..).all(405), pitfall 9.4):
+   method (Express app.route(path).get(..).post(..).all(405)):
    `(resource \"/users\" {:get list :post create})`. A `:all` entry replaces
    the default 405 handler (which throws an http-error 405 carrying an
    Allow header)."
@@ -293,7 +293,7 @@
    :methods (into {} (map (fn [[m h]] [m (flatten-handlers m path [h])])) method-map)})
 
 (defn param
-  "Parameter pre-loader (Express app.param / router.param, inventory 3.2):
+  "Parameter pre-loader (Express app.param / router.param):
    `(param \"id\" (fn [req value] ...))` runs before any route whose path
    has `:id`; return nil to continue, `(continue {:user u})` to enrich the
    request map, a response map to answer, or throw (promises honoured)."
@@ -308,14 +308,14 @@
   "Error-handler entry: `(error f ...)` or `(error \"/api\" f ...)`; each `f`
    is `(fn [err req] ...)` as in `error-handler`. Registered where it
    appears, so put it after the routes it should cover (Express runs error
-   middleware in registration order, inventory 4.3)."
+   middleware in registration order)."
   [& args]
   (let [[path fs] (if (string? (first args)) [(first args) (rest args)] ["/" args])]
     {:op :use :path (check-path path)
      :handlers (mapv #(if (descriptor? %) % (error-handler %)) (flatten-handlers :error path fs))}))
 
 (defn static
-  "Static file entry (express.static, inventory 4.1): `(static \"/static\"
+  "Static file entry (express.static): `(static \"/static\"
    \"/abs/root\" {:dotfiles :ignore :max-age \"1d\" :index false ...})`.
    Equivalent to `(use \"/static\" (middleware/static root opts))`."
   ([path root] (static path root {}))

@@ -1,5 +1,5 @@
 (ns express-cljs.rpc
-  "JSON-RPC 2.0 over both transports (inventory §7): ONE method registry
+  "JSON-RPC 2.0 over both transports: ONE method registry
    served by a single `POST /rpc` route (`http-routes`) and by websocket
    text frames (`serve-ws!`), with the same frames, the same error codes
    (`util/rpc-error-codes`) and the same context-injection contract. Pure
@@ -9,7 +9,7 @@
 
    Methods are `(fn [params ctx] -> result | promise)`. `params` is the
    frame's params (a map with keys keywordised as spelled, a vector, or
-   nil — never re-cased, inventory 11.1). `ctx` is the transport context:
+   nil — never re-cased). `ctx` is the transport context:
    `{:transport :http :request req-map :id .. :method ..}` merged with
    whatever the `:context` fn of `http-routes` returned, or `{:transport
    :ws :conn conn :notify! (fn [method params]) :id .. :method ..}` merged
@@ -19,16 +19,16 @@
    -32602, an http-error 401 / 403 becomes -32001 / -32002, anything
    else -32603 with the message hidden unless `:expose-errors?`.
 
-   Frames on the wire (identical over HTTP and ws, inventory 7.8):
+   Frames on the wire (identical over HTTP and ws):
      {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"math/add\",\"params\":{\"a\":1,\"b\":2}}
      {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":3}
      {\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"method not found: x\"}}
      {\"jsonrpc\":\"2.0\",\"method\":\"events/tick\",\"params\":{..}}   (notification, either direction)
-   Batches (JSON arrays) are rejected with -32600 and `data.batch? true`
-   (uncertainty 10.13). A request without `id` is a notification: it is
+   Batches (JSON arrays) are rejected with -32600 and `data.batch? true`.
+   A request without `id` is a notification: it is
    dispatched and never answered (HTTP answers 204).
 
-   HTTP statuses (inventory 7.2): 200 for every answered request — results
+   HTTP statuses: 200 for every answered request — results
    AND method errors — unless `:status-map? true` maps method errors to
    the status column of `util/rpc-error-codes`; transport failures keep
    their HTTP meaning with a JSON-RPC error body: 400 parse error /
@@ -125,12 +125,12 @@
     (:id frame)))
 
 (defn check-frame
-  "Validates a parsed request frame (inventory 7.1, spec §4): a JSON
+  "Validates a parsed request frame (spec §4): a JSON
    object with `jsonrpc` \"2.0\", a string `method`, a structured `params`
    (object / array / absent) and a valid `id` when present. Returns
    `{:method s :params p :id id :notification? bool}`. Throws an rpc-error
    :invalid-request with :id (nil when undetectable) and :reason; a batch
-   array carries `:batch? true` (uncertainty 10.13)."
+   array carries `:batch? true`."
   [frame]
   (letfn [(invalid [reason data]
             (throw (util/rpc-error :invalid-request (str "Invalid Request: " reason)
@@ -163,7 +163,7 @@
 
 (defn error->frame
   "Any thrown / rejected value from a method -> the JSON-RPC error frame
-   answering request `id` (inventory 7.3 / 7.4): an rpc-error keeps its
+   answering request `id`: an rpc-error keeps its
    code, message and data (`error-data`); an argument-error is -32602 with its message;
    an http-error 401 / 403 is -32001 / -32002, any other http-error
    -32000 with `{:status n}`; a promesa timeout is -32003; everything
@@ -239,7 +239,7 @@
 
 (defn registry
   "Builds the method registry from `{\"name\" (fn [params ctx]) ...}` or
-   `{\"name\" {:fn f :doc \"..\" :timeout-ms 5000} ...}` (inventory 7.3):
+   `{\"name\" {:fn f :doc \"..\" :timeout-ms 5000} ...}`:
    names are non-empty strings; `rpc.*` is reserved. Built-ins: `rpc.ping`
    (answers {:pong true}) unless `:ping? false`, and `rpc.methods`
    (introspection: a vector of {:name :doc}) with `:introspection? true`.
@@ -284,15 +284,15 @@
    per-call deadline; a method's own :timeout-ms wins), :expose-errors?
    (show non-RPC error messages in -32603 frames, default false), :on-error
    (fn [err ctx] called for every error frame produced and for failed
-   notifications, which get no frame), :batch? (reserved marker,
-   uncertainty 10.13: only false is accepted)."
+   notifications, which get no frame), :batch? (reserved marker: only
+   false is accepted)."
   #{:timeout-ms :expose-errors :on-error :batch})
 
 (defn- check-call-opts!
   [op opts]
   (let [o (util/check-opts! op call-option-keys (util/normalize-opts opts))]
     (when (true? (:batch o))
-      (throw (util/argument-error (str (name op) ": JSON-RPC batch requests are not supported (inventory 10.13); :batch? is a reserved marker")
+      (throw (util/argument-error (str (name op) ": JSON-RPC batch requests are not supported; :batch? is a reserved marker")
                                   {:arg :batch})))
     o))
 
@@ -331,13 +331,13 @@
                         frame))))))))
 
 ;; ---------------------------------------------------------------------------
-;; HTTP transport (inventory 7.2)
+;; HTTP transport
 ;; ---------------------------------------------------------------------------
 
 (def http-option-keys
   "http-routes options: :path (default \"/rpc\"), :context (fn [req-map] ->
    map | promise, merged into ctx; a thrown http-error answers at HTTP
-   level), :limit (json body limit, default \"256kb\", pitfall 9.10),
+   level), :limit (json body limit, default \"256kb\"),
    :status-map? (true: method-error frames take the HTTP status of
    `util/rpc-error-codes`; a map {code-keyword status} overrides entries),
    plus the dispatch options of `call-option-keys`."
@@ -402,7 +402,7 @@
 
 (defn http-routes
   "Route entries mounting the registry at `:path` (default \"/rpc\") as ONE
-   endpoint (inventory 7.2): a `route/resource` answering POST (other
+   endpoint: a `route/resource` answering POST (other
    methods get 405 with Allow) through a json body parser with `:limit`
    (default \"256kb\") in non-strict mode (scalars reach frame validation
    as -32600, not as a parse error) and the `http-handler`, plus an
@@ -424,13 +424,13 @@
       (route/error path (fn [err _req] (body-error->response err)))))))
 
 ;; ---------------------------------------------------------------------------
-;; Websocket transport (inventory 7.5 – 7.7)
+;; Websocket transport
 ;; ---------------------------------------------------------------------------
 
 (defn notify!
   "Server -> client notification: sends `{:jsonrpc \"2.0\" :method method
-   :params params}` on the connection (the streaming primitive, inventory
-   7.6). Resolves like `ws/send!`."
+   :params params}` on the connection (the streaming primitive). Resolves
+   like `ws/send!`."
   [conn method params]
   (ws/send-json! conn (notification-frame method params)))
 
@@ -512,7 +512,7 @@
       :stop! (fn [] (off-open) (off-close) nil)})))
 
 ;; ---------------------------------------------------------------------------
-;; Client helper (inventory 7.5) — over a ws connection (server or client
+;; Client helper — over a ws connection (server or client
 ;; side): request/response correlation, notifications both ways.
 ;; ---------------------------------------------------------------------------
 

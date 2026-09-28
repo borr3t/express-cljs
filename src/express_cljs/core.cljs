@@ -1,9 +1,9 @@
 (ns express-cljs.core
   "The ONE binding namespace: every line of Express / Node interop in the
-   library lives here (inventory §11.2). Nothing else in express-cljs, and
+   library lives here. Nothing else in express-cljs, and
    nothing at a call site, touches an Express `app`, a Node `req` / `res`,
-   an `http.Server` or a stream. House style: `js-invoke` + `goog.object`,
-   no `^js` hints, no dot-forms.
+   an `http.Server` or a stream. Interop is written with `js-invoke` +
+   `goog.object`: no `^js` hints, no dot-forms.
 
    Values this namespace hands out:
 
@@ -15,20 +15,19 @@
      <atom>}`; pass it to `close!`, `address`, `listening?`, `connections!`,
      `events`, `add-close-hook!`.
 
-   Handlers are `(fn [req-map] -> response-map | nil | control | promise)`
-   (inventory 11.3 / 11.4): the request map is built by `req->map`, the
-   response map is executed by `respond!`; nil means next(); a rejection or
-   throw goes to the error chain as an ex-info (`->error`), and the
-   wrapper's final error handler renders `util/error-response` (inventory
-   8.5). Streaming: a `:body` that is a Node Readable (see `readable-from`)
-   is piped (uncertainty 10.8).
+   Handlers are `(fn [req-map] -> response-map | nil | control | promise)`:
+   the request map is built by `req->map`, the response map is executed by
+   `respond!`; nil means next(); a rejection or throw goes to the error
+   chain as an ex-info (`->error`), and the wrapper's final error handler
+   renders `util/error-response`. Streaming: a `:body` that is a Node
+   Readable (see `readable-from`) is piped.
 
    Cookies: the `Cookie` header is parsed here (RFC 6265 pair split +
    decodeURIComponent, mirroring the `cookie` package) into :cookies; with
    an app `:cookie-secret`, `s:`-prefixed values are verified with Node
-   crypto (HMAC-SHA256, byte-compatible with `cookie-signature`,
-   uncertainty 10.3) into :signed-cookies and `{:signed? true}` cookie
-   entries are signed on the way out. No cookie-parser dependency."
+   crypto (HMAC-SHA256, byte-compatible with `cookie-signature`) into
+   :signed-cookies and `{:signed? true}` cookie entries are signed on the
+   way out. No cookie-parser dependency."
   (:refer-clojure :exclude [range methods])
   (:require [clojure.string :as str]
             [cljs.core.async :as async]
@@ -72,8 +71,8 @@
          (or (nil? proto) (identical? proto (jsget js/Object "prototype"))))))
 
 (defn- ->clj*
-  "JS -> CLJS with keys keywordised AS SPELLED (never re-cased, inventory
-   11.1); arrays -> vectors; opaque objects untouched."
+  "JS -> CLJS with keys keywordised AS SPELLED (never re-cased); arrays ->
+   vectors; opaque objects untouched."
   [v]
   (cond
     (array? v) (mapv ->clj* (array-seq v))
@@ -92,8 +91,7 @@
   (or (js-invoke js/Buffer "isBuffer" v) (instance? js/Uint8Array v)))
 
 (defn readable?
-  "True for a Node Readable stream (an opaque streaming :body, uncertainty
-   10.8)."
+  "True for a Node Readable stream (an opaque streaming :body)."
   [v]
   (instance? (jsget node-stream "Readable") v))
 
@@ -105,9 +103,9 @@
   (js-invoke (jsget node-stream "Readable") "from" (to-array chunks)))
 
 (def methods
-  "The set of lower-case method keywords this Node exposes (http.METHODS,
-   inventory 3.8); Express derives its app.METHOD functions from the same
-   list, so this is the runtime truth `route/methods` approximates."
+  "The set of lower-case method keywords this Node exposes (http.METHODS);
+   Express derives its app.METHOD functions from the same list, so this is
+   the runtime truth `route/methods` approximates."
   (into #{} (map #(keyword (str/replace (str/lower-case %) "_" "-"))) (array-seq (jsget node-http "METHODS"))))
 
 ;; ---------------------------------------------------------------------------
@@ -115,11 +113,11 @@
 ;; ---------------------------------------------------------------------------
 
 (defn ->error
-  "Normalises any thrown / rejected value into an express-cljs ex-info
-   (inventory 8.6): express-cljs errors and other ex-infos pass through; a
+  "Normalises any thrown / rejected value into an express-cljs ex-info:
+   express-cljs errors and other ex-infos pass through; a
    JS Error with a 4xx/5xx `status` / `statusCode` (body-parser,
    serve-static, res.format http-errors) becomes an http-error carrying
-   :reason (from `err.type`, inventory 4.1), :headers and the upstream
+   :reason (from `err.type`), :headers and the upstream
    :expose flag, with the original as :cause; other JS Errors become a
    server-error with the JS `code`; strings become server-errors with the
    string as message; a falsy rejection is {:code :rejected-falsy}."
@@ -146,7 +144,7 @@
   util/http-error)
 
 ;; ---------------------------------------------------------------------------
-;; Cookies (inventory 4.2, uncertainty 10.3)
+;; Cookies
 ;; ---------------------------------------------------------------------------
 
 (defn- try-decode
@@ -180,9 +178,9 @@
 
 (defn cookie-sign
   "`value.<base64 HMAC-SHA256(secret, value) without trailing =>` —
-   byte-compatible with `cookie-signature.sign` (verified by the dev-only
-   test). Express prefixes the result with `s:` when it sets a signed
-   cookie; `cookie-signed` does the same."
+   byte-compatible with `cookie-signature.sign`. Express prefixes the
+   result with `s:` when it sets a signed cookie; so does the wrapper for
+   a `{:signed? true}` cookie entry."
   [value secret]
   (let [mac (-> (js-invoke node-crypto "createHmac" "sha256" secret)
                 (js-invoke "update" (str value))
@@ -230,7 +228,7 @@
             cookies)))
 
 (def cookie-option-keys
-  "res.cookie options (inventory 5.2): :max-age (ms), :expires (js/Date,
+  "res.cookie options: :max-age (ms), :expires (js/Date,
    epoch ms or date string), :http-only?, :path (default \"/\"), :domain,
    :secure?, :same-site (true / :lax / :strict / :none), :priority (:low /
    :medium / :high), :partitioned?, :encode (fn), :signed?."
@@ -260,7 +258,7 @@
       v)))
 
 ;; ---------------------------------------------------------------------------
-;; Request -> map (inventory 5.1, 11.3)
+;; Request -> map
 ;; ---------------------------------------------------------------------------
 
 (defn- vec-or-empty
@@ -310,7 +308,7 @@
         m)))
 
 (defn req->map
-  "Builds the kebab request map (inventory 11.3) for the current layer:
+  "Builds the kebab request map for the current layer:
    the cached per-request base (headers, cookies, ip, negotiation, ...)
    plus the layer-dependent fields :url :base-url :path :params :query
    :body :route, merged with the context accumulated by `route/continue`
@@ -332,8 +330,8 @@
         (with-meta {:express-cljs/raw {:req req :res res}}))))
 
 (defn upgrade-request->map
-  "The request map of an HTTP `upgrade` request (the websocket handshake,
-   inventory 2.3 / uncertainty 10.9). The raw Node IncomingMessage is not
+  "The request map of an HTTP `upgrade` request (the websocket
+   handshake). The raw Node IncomingMessage is not
    an Express request, so `req.ip`, `req.query`, `req.host` and the
    negotiation helpers do not exist on it; this gives it Express's request
    prototype (`Object.setPrototypeOf(req, app.request)`, exactly what
@@ -353,9 +351,9 @@
 
 (defn with-raw
   "Escape hatch: calls `(f raw-req raw-res)` with the Node / Express
-   objects behind a request map (for a caller-mounted multer etc.,
-   inventory 4.2). Returns f's result. Throws an argument-error when the
-   map did not come from `req->map`."
+   objects behind a request map (for a caller-mounted multer etc.).
+   Returns f's result. Throws an argument-error when the map did not come
+   from `req->map`."
   [req f]
   (let [{:keys [req res]} (:express-cljs/raw (meta req))]
     (when (nil? req)
@@ -379,7 +377,7 @@
 (defn is?
   "req.is: the matched type string when the request body's Content-Type
    matches `type` (\"json\", \"application/*\"), false when it does not,
-   and nil when the request has no body at all (pitfall 9.9)."
+   and nil when the request has no body at all."
   [req type]
   (let [r (js-invoke (raw-req req) "is" (if (keyword? type) (name type) type))]
     (cond (nil? r) nil (false? r) false :else r)))
@@ -409,7 +407,7 @@
   (into [] (comp (map str/trim) (remove str/blank?)) (str/split s #",")))
 
 (defn fresh?
-  "The `fresh` algorithm behind req.fresh (inventory 5.1, uncertainty 10.6)
+  "The `fresh` algorithm behind req.fresh
    evaluated against the RESPONSE HEADERS you intend to send (`{:etag ..
    :last-modified ..}`, kebab) rather than headers already set on `res`:
    true when the client's copy is still valid and a 304 is appropriate.
@@ -444,7 +442,7 @@
   (not (fresh? req res-headers)))
 
 ;; ---------------------------------------------------------------------------
-;; Response map -> res (inventory 5.2, 11.4)
+;; Response map -> res
 ;; ---------------------------------------------------------------------------
 
 (defn- set-headers!
@@ -489,7 +487,7 @@
     :else (js-invoke res "send" body)))
 
 (defn respond!
-  "Executes a response map against `res` exactly once (inventory 5.2):
+  "Executes a response map against `res` exactly once:
    validates it (`util/check-response!`), then applies :status (default
    200; 204 for `:end true`), :type, :headers, :vary, :links, :attachment,
    :cookies (with signing), :clear-cookies, and finally the single body
@@ -549,7 +547,7 @@
     nil))
 
 ;; ---------------------------------------------------------------------------
-;; Handler adapters (inventory 11.2, 4.3, 8.6)
+;; Handler adapters
 ;; ---------------------------------------------------------------------------
 
 (defn- apply-control!
@@ -574,7 +572,7 @@
 (defn- run-handler!
   "Runs `(f req-map)` (sync or promise) and dispatches; every failure ends
    as `next(ex-info)`. Returns nil so Express's own promise forwarding
-   (inventory 1.4) never sees a value."
+   never sees a value."
   [app f req res next]
   (-> (p/do (f (req->map app req res)))
       (p/then (fn [result] (dispatch! app result req res next)))
@@ -638,15 +636,14 @@
 (defn not-found
   "The wrapper's final 404 middleware as a handler: throws an http-error
    404 {:reason :not-found :path ..} for every request except OPTIONS,
-   which continues so the router's automatic `Allow` answer (inventory
-   3.3) can fire."
+   which continues so the router's automatic `Allow` answer can fire."
   [req]
   (if (= :options (:method req))
     nil
     (throw (util/http-error 404 "Not Found" {:reason :not-found :path (:original-url req)}))))
 
 ;; ---------------------------------------------------------------------------
-;; Built-in middleware instantiation (inventory 4.1)
+;; Built-in middleware instantiation
 ;; ---------------------------------------------------------------------------
 
 (defn- static-middleware
@@ -748,7 +745,7 @@
 
 (defn setting
   "Reads an Express app setting by kebab keyword (`:trust-proxy`, `:env`,
-   `:x-powered-by`, inventory 3.9); nil when unset."
+   `:x-powered-by`); nil when unset."
   [app k]
   (let [v (js-invoke (:express app) "get" (util/kebab->setting k))]
     (if (nil? v) nil (->clj* v))))
@@ -775,8 +772,7 @@
 (defn app
   "Builds an Express 5 application from options and any number of route
    sources (tables, `route/routes` bundles, entries — see
-   express-cljs.route), registered in argument order. Options (kebab,
-   inventory 3.9 / 11.2):
+   express-cljs.route), registered in argument order. Options (kebab):
 
      :env                    :production | :development | :test (Express
                              'env'; :test silences the 5xx console log)
@@ -846,7 +842,7 @@
 
 (defn mount-upstream!
   "Appends a caller-supplied Express middleware function `(req, res, next)`
-   (inventory 4.2: cors / helmet / multer instances the caller requires in
+   (cors / helmet / multer instances the caller requires in
    its own code) at `path` (default \"/\") AFTER the routes given to `app`
    — Express runs layers in registration order, so use this for
    middleware that should see requests no route answered. For middleware
@@ -871,7 +867,7 @@
   (:express (finalize! app)))
 
 ;; ---------------------------------------------------------------------------
-;; Server lifecycle (inventory 5.3)
+;; Server lifecycle
 ;; ---------------------------------------------------------------------------
 
 (def listen-option-keys
@@ -900,7 +896,7 @@
                          (fn [err n] (if err (reject (->error err)) (resolve n)))))))
 
 (defn events
-  "The app's core.async channel of lifecycle events (inventory 11.5):
+  "The app's core.async channel of lifecycle events:
    {:event :listening :address ..}, {:event :close}, {:event :error
    :error e :status .. :method .. :path ..} for every rendered error,
    {:event :server-error :error e} for http.Server 'error' / 'clientError'
@@ -911,7 +907,7 @@
 (defn add-close-hook!
   "Registers `(fn [{:keys [timeout-ms]}] -> promise | any)` to run at the
    start of `close!` (the seam the websocket layer uses to close its
-   clients before the HTTP server stops, inventory 5.3). Hooks run
+   clients before the HTTP server stops). Hooks run
    concurrently; a rejection is emitted as {:event :server-error} and
    does not abort the shutdown. Returns the server handle."
   [server f]
@@ -964,7 +960,7 @@
   #{:timeout-ms :ws-close-timeout-ms})
 
 (defn close!
-  "Graceful shutdown (inventory 5.3 house choreography): (1) run the close
+  "Graceful shutdown, in four steps: (1) run the close
    hooks (websocket clients) with :ws-close-timeout-ms, (2) server.close —
    stop accepting; Node >= 19 also reaps idle keep-alive connections, and
    closeIdleConnections is called explicitly for older Nodes, (3) after
@@ -972,7 +968,7 @@
    (4) resolve {:closed true :forced? bool} when the close callback fires.
    Rejects with a server-error {:code :err-server-not-running} when the
    server is not listening. Afterwards the process holds no handle from
-   this server (liveness precedent)."
+   this server, so it can exit on its own."
   ([server] (close! server {}))
   ([server opts]
    (let [{:keys [timeout-ms ws-close-timeout-ms] :or {timeout-ms 5000 ws-close-timeout-ms 2000}}

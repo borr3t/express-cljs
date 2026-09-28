@@ -1,9 +1,9 @@
 (ns express-cljs.ws
-  "WebSockets on the wrapper's HTTP server through the `ws` package
-   (inventory §2.3 / §6 / §12.4). This is the SECOND and last binding
-   namespace: every line of `ws` and raw-socket interop lives here (house
-   style `js-invoke` + `goog.object`, no `^js`, no dot-forms); `rpc` and
-   application code only see the values below.
+  "WebSockets on the wrapper's HTTP server through the `ws` package. This
+   is the SECOND and last binding namespace: every line of `ws` and
+   raw-socket interop lives here (written with `js-invoke` + `goog.object`,
+   no `^js`, no dot-forms); `rpc` and application code only see the values
+   below.
 
    Values:
 
@@ -19,7 +19,7 @@
      :opened-at}`. Its metadata `:express-cljs/raw` carries the socket, so
      `send!`, `close!`, `ping!`, `messages`, `closed` need only the map.
 
-   Channels (inventory 11.5): `(messages conn)` yields `{:type :text :data
+   Channels: `(messages conn)` yields `{:type :text :data
    \"..\"}` / `{:type :binary :data <Buffer>}` (plus :json with the
    `:decode :json` option) and closes when the socket closes; a full
    buffer pauses the socket (receive backpressure). `(out conn)` sends
@@ -34,8 +34,8 @@
    answers 404 for the rest; `:authenticate` runs before the handshake and
    can answer 401 / 403 as real HTTP responses; `serve!` also registers a
    `core/add-close-hook!` so `core/close!` closes every client with 1001,
-   waits :ws-close-timeout-ms, terminates the leftovers and detaches
-   (inventory 5.3). The keepalive interval is unref'd (6.7)."
+   waits :ws-close-timeout-ms, terminates the leftovers and detaches. The
+   keepalive interval is unref'd."
   (:require [clojure.string :as str]
             [cljs.core.async :as async]
             [goog.object :as gobj]
@@ -85,7 +85,7 @@
 
 (defn ->json
   "Serialises a CLJS value as a JSON string (keywords render as their
-   name, keys are never re-cased, inventory 11.1)."
+   name, keys are never re-cased)."
   [v]
   (js-invoke js/JSON "stringify" (clj->js v :keyword-fn name)))
 
@@ -104,16 +104,16 @@
                               {:code :invalid-json :cause e}))))))
 
 (def json
-  "Alias of `parse-json` (inventory 12.4 name)."
+  "Alias of `parse-json`."
   parse-json)
 
 ;; ---------------------------------------------------------------------------
-;; Errors and close codes (inventory 6.6 / 6.12 / 8.4)
+;; Errors and close codes
 ;; ---------------------------------------------------------------------------
 
 (defn valid-close-code?
   "RFC 6455 codes ws accepts in `close(code)`: 1000..1014 except 1004 /
-   1005 / 1006, or 3000..4999 (pitfall 9.22)."
+   1005 / 1006, or 3000..4999."
   [code]
   (and (integer? code)
        (or (and (<= 1000 code 1014) (not (contains? #{1004 1005 1006} code)))
@@ -124,7 +124,7 @@
    kebab `WS_ERR_*` code (ws/lib/receiver.js: 1009 for length limits,
    1007 for UTF-8, 1002 for every framing violation). The SERVER-side
    'close' event still reports 1006 (the receiver stops parsing before
-   the peer's reply; uncertainty 10.2) — the client sees this code."
+   the peer's reply) — the client sees this code."
   {:unsupported-message-length 1009
    :unsupported-data-payload-length 1009
    :too-many-buffered-parts 1009
@@ -180,7 +180,7 @@
   (= :open (ready-state conn)))
 
 (defn buffered-amount
-  "Bytes queued on the socket and not yet flushed (inventory 6.8)."
+  "Bytes queued on the socket and not yet flushed."
   [conn]
   (or (jsget (sock conn) "bufferedAmount") 0))
 
@@ -245,11 +245,11 @@
    explicit form for maps). Rejects with a ws-error {:code :closed} when
    the connection is not open and {:code :backpressure} when
    `bufferedAmount` exceeds :max-buffered-bytes (default 8 MiB) instead of
-   buffering without bound (inventory 6.8)."
+   buffering without bound."
   [conn data]
   (let [{:keys [ws opts]} (raw-of conn)
         [d binary?] (payload data)
-        max-buf (get opts :max-buffered-bytes 8388608)
+        max-buf (get opts :max-buffered-bytes (* 8 1024 1024))
         buffered (or (jsget ws "bufferedAmount") 0)]
     (cond
       (not= 1 (jsget ws "readyState"))
@@ -294,9 +294,9 @@
    :forced?}`. If the peer has not answered after :timeout-ms (default
    the connection's :close-timeout-ms, 2000) the socket is terminated —
    the wrapper's deadline wins over ws's own 30 s closeTimeout
-   (uncertainty 10.17; ws guards against a second 'close' event). Throws
+   (ws guards against a second 'close' event). Throws
    a ws-error {:code :invalid-close-code | :invalid-close-reason}
-   synchronously for a code ws would reject (pitfall 9.22). Idempotent:
+   synchronously for a code ws would reject. Idempotent:
    an already closed connection resolves at once."
   ([conn] (close! conn 1000 nil {}))
   ([conn code] (close! conn code nil {}))
@@ -337,7 +337,7 @@
 (defn ping!
   "Sends a ping frame and resolves with the round-trip time in
    milliseconds when the matching pong arrives (ws answers pings
-   automatically on both sides, inventory 6.7). `data` (default a
+   automatically on both sides). `data` (default a
    counter) is the ping payload echoed in the pong. Rejects with a
    ws-error {:code :closed} when not open and {:code :timeout} after
    :timeout-ms (default 5000, unref'd timer)."
@@ -491,7 +491,7 @@
 
 (defn join!
   "Adds the connection to `topic` (a string or keyword; rooms are a
-   wrapper-level concept, inventory 6.10). Returns the topic's member
+   wrapper-level concept). Returns the topic's member
    count. A connection leaves all its topics when it closes."
   [ws-server conn topic]
   (let [t (topic-name topic)
@@ -540,7 +540,7 @@
    the 2-arity), to a topic (string / keyword), or to a collection of
    connection maps. Option :except excludes one connection (the sender).
    Resolves `{:sent n :failed n :errors [..]}` — a closed peer never
-   rejects the broadcast (inventory 6.10)."
+   rejects the broadcast."
   ([ws-server data] (broadcast! ws-server :all data {}))
   ([ws-server target data] (broadcast! ws-server target data {}))
   ([ws-server target data {:keys [except]}]
@@ -562,7 +562,7 @@
   ([ws-server topic data opts] (broadcast! ws-server topic data opts)))
 
 ;; ---------------------------------------------------------------------------
-;; Upgrade handling (inventory 2.3, 6.9)
+;; Upgrade handling
 ;; ---------------------------------------------------------------------------
 
 (defn- pathname
@@ -591,7 +591,7 @@
    behind the ONE Node 'upgrade' listener (created on first use): the
    first route whose :match accepts the request handles it; without a
    match the socket gets a 404 (Node accepts every upgrade once a
-   listener exists, inventory 2.3)."
+   listener exists)."
   [raw]
   (or (jsget raw upgrade-key)
       (let [reg (atom [])]
@@ -620,7 +620,7 @@
       [500 "Internal Server Error" {}])))
 
 (defn- protocol-selector
-  "`:protocols` option -> ws handleProtocols fn (inventory 6.9): a vector
+  "`:protocols` option -> ws handleProtocols fn: a vector
    of accepted names picks the first client-offered one that is
    accepted; a fn receives (offered-vector upgrade-map) and returns a
    name or nil."
@@ -638,10 +638,10 @@
 
 (def serve-option-keys
   "serve! options (kebab, `?` stripped): :path (string, set of strings or
-   pathname predicate; default \"/ws\"), :max-payload (bytes, default 1 MiB,
-   pitfall 9.10), :keepalive-ms (default 30000; false disables),
+   pathname predicate; default \"/ws\"), :max-payload (bytes, default 1
+   MiB), :keepalive-ms (default 30000; false disables),
    :authenticate (fn [upgrade-map] -> ctx | promise | nil), :protocols
-   (vector or fn, inventory 6.9), :handshake-headers (fn [upgrade-map] ->
+   (vector or fn), :handshake-headers (fn [upgrade-map] ->
    header map added to the 101 response), :per-message-deflate (boolean or
    option map), :close-timeout-ms (the wrapper's per-socket deadline,
    default 2000), :max-buffered-bytes (send backpressure limit, default
@@ -720,7 +720,7 @@
 
 (defn- handle-upgrade!
   "The per-serve! upgrade handler: request map, authenticate, accept or
-   answer a real HTTP error before the handshake (inventory 2.3)."
+   answer a real HTTP error before the handshake."
   [ws-server req socket head]
   (let [app (:app (:server ws-server))
         {:keys [authenticate]} (:opts ws-server)]
@@ -740,7 +740,7 @@
                            (abort-upgrade! socket status message headers))))))))))
 
 ;; ---------------------------------------------------------------------------
-;; Keepalive (inventory 6.7)
+;; Keepalive
 ;; ---------------------------------------------------------------------------
 
 (defn- keepalive-tick!
@@ -757,8 +757,7 @@
               (js-invoke ws "ping")))))))
 
 (defn- start-keepalive!
-  "One unref'd setInterval per ws-server (never keeps the process alive,
-   liveness precedent)."
+  "One unref'd setInterval per ws-server (never keeps the process alive)."
   [ws-server ms]
   (when (and (number? ms) (pos? ms))
     (let [t (js/setInterval (fn [] (keepalive-tick! ws-server)) ms)]
@@ -841,7 +840,7 @@
      ws-server)))
 
 (defn stop!
-  "Shuts the websocket endpoint down (inventory 5.3 choreography, run by
+  "Shuts the websocket endpoint down (run by
    `core/close!` through the close hook — call it directly only to stop
    the endpoint while the HTTP server keeps running): stops accepting
    upgrades (503), clears the keepalive interval, sends `close(1001,
@@ -874,7 +873,7 @@
          done)))))
 
 ;; ---------------------------------------------------------------------------
-;; Client side (tests, smoke, service-to-service)
+;; Client side (tests, service-to-service)
 ;; ---------------------------------------------------------------------------
 
 (def connect-option-keys
