@@ -515,6 +515,17 @@ forwarding is the second net). Error handlers are =(fn [err req] -> response | n
 option (run before the renderer). =nil= passes the error on, a response map
 answers, a throw replaces the error.
 
+Express tells an error handler from a request handler by =fn.length= alone
+(=router/lib/layer.js=: while an error is in the pipeline, a layer whose function
+has any length other than 4 is skipped silently). Closure's advanced
+optimizations drop a function's unused trailing parameters, so a four-parameter
+ClojureScript =fn= that never calls =next= — the wrapper's final renderer — would
+compile to a 3-parameter function under =:advanced= and every error would reach
+Express's own HTML error page instead. The wrapper therefore pins =length= to 4
+on every error middleware it builds (=Object.defineProperty=; =length= is
+configurable), and the suite asserts the lengths of the compiled layer functions
+under both optimization levels it runs.
+
 The wrapper's final renderer (=util/error-response=, pure) answers
 ={:error {:status :message :reason}}= as JSON when the client accepts JSON (or sent
 JSON), else =text/plain= =<status> <message>=, with =X-Content-Type-Options:
@@ -584,9 +595,12 @@ works.
   instead of pausing a socket it intends to close.
 
 * Testing and the smoke
-- =./run-tests.sh= compiles the =:node-test= build and runs it: 127 tests / 1027
-  assertions across =util=, =route=, =middleware=, =core=, =ws=, =rpc= (about 4 s
-  of test time after the shadow-cljs compile). Server tests listen on ephemeral
+- =./run-tests.sh= compiles the =:node-test= build and runs it twice: the
+  development build, then a release build at =:advanced= (the optimization level
+  consumers ship; see "The chain and arity-4 handlers" for why the suite must
+  pass on that output too): 137 tests / 1094 assertions per lane across =util=,
+  =route=, =middleware=, =core=, =ws=, =rpc= (about 4 s of test time per lane
+  after the shadow-cljs compiles). Server tests listen on ephemeral
   127.0.0.1 ports and close them; every websocket test uses =ws/connect!=;
   =EXPRESS_CLJS_TRACE=1= prints each async test as it starts and ends. The only
   test file with interop is =test/express_cljs/test_util.cljs= (fetch, the raw

@@ -584,20 +584,36 @@
   [app f]
   (fn [req res next] (run-handler! app f req res next)))
 
+(defn- error-middleware
+  "Pins `fn.length` of an Express error middleware to 4. Express tells an
+   error handler from a request handler by `fn.length` alone: while an
+   error is in the pipeline a layer whose function has any other length is
+   skipped without a word (router/lib/layer.js). The ClojureScript source
+   names four parameters, but Closure's advanced optimizations drop a
+   function's unused trailing parameters, so a wrapper that never calls
+   `next` compiles to a 3-parameter function under :advanced and the
+   wrapper's error layers vanish from the chain. `length` is a configurable
+   property of every function, so it is set explicitly, whatever signature
+   the optimization level produced. Returns `f`."
+  [f]
+  (js-invoke js/Object "defineProperty" f "length" (clj->js {:value 4 :configurable true})))
+
 (defn- error-adapter
   "CLJS error handler (fn [err req]) -> Express (err, req, res, next)
-   middleware (arity 4 — Express detects error handlers by fn.length)."
+   middleware (arity 4 — Express detects error handlers by fn.length, pinned
+   by `error-middleware`)."
   [app f]
-  (fn [err req res next]
-    (let [e (->error err)]
-      (-> (p/do (f e (req->map app req res)))
-          (p/then (fn [result]
-                    (cond
-                      (nil? result) (next e)
-                      (route/control? result) (apply-control! result req res next)
-                      :else (respond! app result req res next))))
-          (p/catch (fn [e2] (next (->error e2)))))
-      nil)))
+  (error-middleware
+   (fn [err req res next]
+     (let [e (->error err)]
+       (-> (p/do (f e (req->map app req res)))
+           (p/then (fn [result]
+                     (cond
+                       (nil? result) (next e)
+                       (route/control? result) (apply-control! result req res next)
+                       :else (respond! app result req res next))))
+           (p/catch (fn [e2] (next (->error e2)))))
+       nil))))
 
 (defn- param-adapter
   "CLJS param loader (fn [req value]) -> Express (req, res, next, value, name)."
@@ -616,22 +632,26 @@
 
 (defn- final-error-handler
   "The wrapper's last arity-4 middleware: renders util/error-response,
-   emits {:event :error} and calls the app's :on-error."
+   emits {:event :error} and calls the app's :on-error. It never calls
+   `next` (it is the end of the chain), which is exactly the parameter
+   Closure's advanced pass would drop — `error-middleware` keeps the
+   length Express reads at 4."
   [app]
-  (fn [err req res _next]
-    (let [e (->error err)
-          req-map (req->map app req res)
-          response (util/error-response e req-map {:env (:env app)
-                                                   :expose-errors? (get-in app [:opts :expose-errors])})
-          on-error (get-in app [:opts :on-error])]
-      (emit! app {:event :error :error e :status (:status response)
-                  :method (:method req-map) :path (:original-url req-map)})
-      (when on-error (try (on-error e req-map) (catch :default _ nil)))
-      (when (and (nil? on-error) (>= (:status response) 500) (not= :test (:env app)))
-        (js-invoke js/console "error" (str "express-cljs: " (ex-message e)) (or (:cause (ex-data e)) "")))
-      (if (headers-sent? res)
-        (js-invoke res "destroy")
-        (respond! app response req res (fn [_] (js-invoke res "end")))))))
+  (error-middleware
+   (fn [err req res _next]
+     (let [e (->error err)
+           req-map (req->map app req res)
+           response (util/error-response e req-map {:env (:env app)
+                                                    :expose-errors? (get-in app [:opts :expose-errors])})
+           on-error (get-in app [:opts :on-error])]
+       (emit! app {:event :error :error e :status (:status response)
+                   :method (:method req-map) :path (:original-url req-map)})
+       (when on-error (try (on-error e req-map) (catch :default _ nil)))
+       (when (and (nil? on-error) (>= (:status response) 500) (not= :test (:env app)))
+         (js-invoke js/console "error" (str "express-cljs: " (ex-message e)) (or (:cause (ex-data e)) "")))
+       (if (headers-sent? res)
+         (js-invoke res "destroy")
+         (respond! app response req res (fn [_] (js-invoke res "end"))))))))
 
 (defn not-found
   "The wrapper's final 404 middleware as a handler: throws an http-error

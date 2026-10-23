@@ -116,6 +116,16 @@
   []
   (vec (array-seq (js-invoke js/process "getActiveResourcesInfo"))))
 
+(defn layer-arities
+  "`fn.length` of every layer function of the finalized app's router
+   stack, in registration order — the one number Express reads to tell an
+   error handler (4) from a request handler (3 or fewer). Read from the
+   compiled functions, so it reports what the optimization level actually
+   produced."
+  [app]
+  (mapv #(gobj/get (gobj/get % "handle") "length")
+        (array-seq (gobj/get (gobj/get (core/handler app) "router") "stack"))))
+
 (defn cookie-signature-sign
   "Dev-only oracle: `cookie-signature.sign` from the package Express itself
    depends on (never a runtime dependency of the wrapper)."

@@ -556,7 +556,7 @@ docs/
 
 ```bash
 npm install
-./run-tests.sh     # the publicity gate, then the unit suite; loopback only
+./run-tests.sh     # the publicity gate, then the unit suite twice: development build and :advanced release build; loopback only
 npx shadow-cljs compile examples && node target/examples.js   # the examples of this page
 npx shadow-cljs compile smoke && node target/smoke.js         # the smoke; loopback only
 dev/api-index.sh --check                                      # every public function has a docstring and stands in the manual
@@ -565,6 +565,9 @@ dev/api-index.sh --check                                      # every public fun
 The suite starts real servers on free ports of 127.0.0.1 and closes them; it covers
 the translation of requests and responses, routing, middleware, websockets, the RPC
 layer over both transports, and the examples of this page: it fails when this page
-shows code or a result that the examples do not produce. `./run-tests.sh` ends by
+shows code or a result that the examples do not produce. The suite runs on the
+development build and again on the `:advanced` release build, because Express
+recognises error handlers by `fn.length` and Closure's advanced pass rewrites
+function signatures. `./run-tests.sh` ends by
 replacing its shell with node, so nothing can follow it on the same command line.
 `EXPRESS_CLJS_TRACE=1` prints each asynchronous test as it starts and ends.
