@@ -564,6 +564,34 @@
               (is (= 10 (count @on-error-calls)) ":on-error called per rendered error")
               (is (= [418 "/http"] (nth @on-error-calls 4))))))))))
 
+(deftest error-layers-keep-the-arity-express-reads
+  ;; Express tells an error handler from a request handler by fn.length
+  ;; alone. Closure's advanced optimizations drop unused trailing
+  ;; parameters, so the number is asserted on the compiled layer functions
+  ;; (the suite runs under more than one optimization level) and then on
+  ;; the wire: an error must reach the wrapper's renderer, never Express's
+  ;; own HTML error page.
+  (async done
+    (tu/finish done
+      (let [app (core/app {:env :test :error-handler (fn [_ _] nil)}
+                          (route/get "/ok" (fn [_] {:body "ok"}))
+                          (route/error (fn [_ _] nil)))]
+        (is (= [3 4 4 3 4] (tu/layer-arities app))
+            "route, route-level error handler, app :error-handler, 404 layer, final renderer")
+        (p/do
+          (tu/with-server app
+            (fn [_ base]
+              (p/let [r (tu/fetch! (str base "/nope"))]
+                (is (= [404 {:status 404 :message "Not Found" :reason "not-found"}] [(:status r) (error-of r)])
+                    "the 404 goes through the wrapper's renderer"))))
+          (tu/with-server
+            (core/app {:env :test} (route/get "/boom" (fn [_] (throw (ex-info "boom" {})))))
+            (fn [_ base]
+              (p/let [r (tu/fetch! (str base "/boom") {:headers {:accept "text/plain"}})]
+                (is (= [500 "text/plain; charset=utf-8" "500 boom"]
+                       [(:status r) (get-in r [:headers :content-type]) (:body r)])
+                    "a throw is rendered by the wrapper (text for a text client), not by Express's HTML page")))))))))
+
 (deftest production-hides-messages-and-app-level-error-handler
   (async done
     (tu/finish done
